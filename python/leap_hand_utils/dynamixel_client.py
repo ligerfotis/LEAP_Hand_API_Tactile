@@ -18,6 +18,9 @@ ADDR_PRESENT_CURRENT = 126
 ADDR_PRESENT_POS_VEL_CUR = 126
 ADDR_PRESENT_POS_VEL = 128
 
+ADDR_GOAL_VELOCITY = 104  # Check your motor manual for the correct address.
+LEN_GOAL_VELOCITY = 4
+
 # Data Byte Length
 LEN_PRESENT_POSITION = 4
 LEN_PRESENT_VELOCITY = 4
@@ -245,6 +248,19 @@ class DynamixelClient:
         positions = positions / self._pos_vel_cur_reader.pos_scale
         self.sync_write(motor_ids, positions, ADDR_GOAL_POSITION,
                         LEN_GOAL_POSITION)
+
+    def write_desired_vel(self, motor_ids: Sequence[int], velocities: np.ndarray):
+        """Writes the desired velocities to the motors.
+
+        Args:
+             motor_ids: The motor IDs to write to.
+             velocities: The desired velocities in radians per second.
+        """
+        assert len(motor_ids) == len(velocities)
+        # Convert the velocities from rad/s to the motor's internal units.
+        # The conversion factor is DEFAULT_VEL_SCALE.
+        velocities = velocities / DEFAULT_VEL_SCALE
+        self.sync_write(motor_ids, velocities, ADDR_GOAL_VELOCITY, LEN_GOAL_VELOCITY)
 
     def write_byte(
             self,
