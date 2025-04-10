@@ -1,332 +1,339 @@
+import threading
 import tkinter as tk
-import tkinter.simpledialog as simpledialog
-import tkinter.messagebox as messagebox
 import numpy as np
 import time
-import json
-import os
-import threading
-from PIL import Image, ImageTk
-import cv2
-import pyrealsense2 as rs
-
+from sensor_manager import SensorManager
+from trajectory_manager import TrajectoryManager
+from configuration_manager import ConfigurationManager
+from finger_teach_manager import FingerTeachManager
+from leap_node import LeapNode
 import leap_hand_utils as lhu
-from python.leap_hand_utils.leap_node import LeapNode
+from PIL import Image, ImageTk
 
-# Import the Digit class from digit-interface package.
-from digit_interface import Digit
+# Global smoothing parameters for smooth movements (unless explicitly overridden)
+GLOBAL_SMOOTHING_STEPS = 90   # Default interpolation steps for smooth transitions
+GLOBAL_SMOOTHING_DELAY = 20    # Default delay in ms between steps
 
 class LeapHandGUI:
     def __init__(self, master):
         self.master = master
         master.title("LEAP Hand Real-Time Control GUI")
 
-        # Variables to control stream dimensions (default values)
-        self.stream_width_var = tk.IntVar(value=640)
-        self.stream_height_var = tk.IntVar(value=480)
+        # Use smaller default dimensions for streams
+        self.stream_width_var = tk.IntVar(value=320)
+        self.stream_height_var = tk.IntVar(value=240)
+        self.playing_paused = False
 
-        # Create two main frames: left for controls, right for sensor streams.
+        # Main layout frames
         self.left_frame = tk.Frame(master)
         self.left_frame.pack(side=tk.LEFT, padx=10, pady=10, fill=tk.BOTH, expand=True)
         self.right_frame = tk.Frame(master)
         self.right_frame.pack(side=tk.RIGHT, padx=10, pady=10, fill=tk.BOTH, expand=True)
 
-        # Create an instance of LeapNode.
+        # Create LeapNode instance. (It now does not immediately command a pose.)
         self.leap_node = LeapNode()
+        self.leap_node.initialize_current_pose_from_motors()
 
-        # Compute the target flat hand pose.
+        # Compute the safe (flat) pose.
         flat_pose_rad = lhu.allegro_to_LEAPhand(np.zeros(16))
         flat_pose_deg = np.rad2deg(flat_pose_rad)
         for idx in [1, 5, 9]:
             flat_pose_deg[idx] = 94
-        target_pose = np.deg2rad(flat_pose_deg)
-        self.move_to_pose(target_pose, steps=50, delay=50)
+        default_pose = np.deg2rad(flat_pose_deg)
+        safe_pose = lhu.angle_safety_clip(default_pose)
+        # Pause the control loop, smoothly move to the default (flat) pose with slower parameters, then resume.
+        self.leap_node.pause_control_loop()
+        self.move_to_pose(safe_pose, override_safety=True)
+        self.leap_node.resume_control_loop()
 
-        # --------------------------
-        # Left Frame: Controls
-        # --------------------------
-        # --- GUI for manual control (sliders) ---
+        # -------------------------
+        # LEFT SIDE – Manual Controls, Configuration, etc.
+        # -------------------------
         finger_names = ["Index", "Middle", "Ring", "Thumb"]
         joint_names = ["MCP Side", "MCP Forward", "PIP", "DIP"]
-        self.joint_labels = [f"{finger} {joint}" for finger in finger_names for joint in joint_names]
+        self.joint_labels = [f"{f} {j}" for f in finger_names for j in joint_names]
 
         self.slider_frame = tk.Frame(self.left_frame)
         self.slider_frame.pack(padx=5, pady=5)
-
         self.sliders = []
         for i in range(16):
-            label = tk.Label(self.slider_frame, text=self.joint_labels[i])
-            label.grid(row=i, column=0, padx=5, pady=3, sticky="w")
-            slider = tk.Scale(self.slider_frame, from_=0, to=360, orient=tk.HORIZONTAL,
-                              resolution=1, length=300, command=self.slider_changed)
-            slider.set(flat_pose_deg[i])
-            slider.grid(row=i, column=1, padx=5, pady=3)
-            self.sliders.append(slider)
+            tk.Label(self.slider_frame, text=self.joint_labels[i]).grid(
+                row=i, column=0, sticky="w", padx=5, pady=3)
+            s = tk.Scale(self.slider_frame, from_=0, to=360, orient=tk.HORIZONTAL,
+                         resolution=1, length=300, command=self.slider_changed)
+            s.set(flat_pose_deg[i])
+            s.grid(row=i, column=1, padx=5, pady=3)
+            self.sliders.append(s)
 
-        self.read_button = tk.Button(self.left_frame, text="Read Current Positions", command=self.read_positions)
-        self.read_button.pack(pady=5)
-        self.current_positions_label = tk.Label(self.left_frame, text="Current Positions: ")
-        self.current_positions_label.pack(pady=5)
-
-        # --- GUI for Finger Teach Mode ---
+        # --- Finger Teach Manager ---
         self.fingers = {
             "Index": [0, 1, 2, 3],
             "Middle": [4, 5, 6, 7],
             "Ring": [8, 9, 10, 11],
             "Thumb": [12, 13, 14, 15]
         }
-        self.finger_teach_modes = {}
-        self.finger_teach_buttons = {}
-        self.finger_teach_status = {}
-
         self.finger_teach_frame = tk.Frame(self.left_frame)
         self.finger_teach_frame.pack(padx=5, pady=5, fill=tk.X)
-        for finger in self.fingers.keys():
-            self.finger_teach_modes[finger] = False
-            finger_frame = tk.Frame(self.finger_teach_frame)
-            finger_frame.pack(side=tk.TOP, fill=tk.X, pady=2)
-            btn = tk.Button(finger_frame, text=f"{finger}: Enter Teach Mode",
-                            command=lambda f=finger: self.toggle_finger_teach_mode(f))
+        self.finger_teach_buttons = {}
+        self.finger_teach_status = {}
+        for finger in self.fingers:
+            f_frame = tk.Frame(self.finger_teach_frame)
+            f_frame.pack(side=tk.TOP, fill=tk.X, pady=2)
+            btn = tk.Button(f_frame, text=f"{finger}: Enter Teach Mode")
             btn.pack(side=tk.LEFT, padx=5)
+            lbl = tk.Label(f_frame, text="Normal")
+            lbl.pack(side=tk.LEFT, padx=5)
             self.finger_teach_buttons[finger] = btn
-            status_label = tk.Label(finger_frame, text="Normal")
-            status_label.pack(side=tk.LEFT, padx=5)
-            self.finger_teach_status[finger] = status_label
+            self.finger_teach_status[finger] = lbl
 
-        # --- GUI for Configuration Library ---
+        self.finger_teach_manager = FingerTeachManager(
+            self.master, self.fingers, self.leap_node, self.sliders, self.move_to_pose)
+        self.finger_teach_manager.register_ui_refs(self.finger_teach_buttons, self.finger_teach_status)
+
+        def make_teach_command(finger, button, label):
+            return lambda: self.finger_teach_manager.toggle_finger_teach_mode(finger, button, label)
+
+        for finger in self.fingers:
+            self.finger_teach_buttons[finger].config(
+                command=make_teach_command(finger, self.finger_teach_buttons[finger],
+                                           self.finger_teach_status[finger])
+            )
+
+        # --- Configuration Manager ---
         self.config_frame = tk.Frame(self.left_frame)
         self.config_frame.pack(padx=5, pady=5, fill=tk.X)
-        self.save_config_button = tk.Button(self.config_frame, text="Save Current Configuration",
-                                            command=self.save_current_configuration)
+        self.save_config_button = tk.Button(self.config_frame, text="Save Current Configuration")
         self.save_config_button.grid(row=0, column=0, padx=5, pady=5)
         self.config_listbox = tk.Listbox(self.config_frame, height=6, width=40)
         self.config_listbox.grid(row=1, column=0, padx=5, pady=5)
-        self.load_config_button = tk.Button(self.config_frame, text="Load Selected Configuration",
-                                            command=self.load_selected_configuration)
+        self.load_config_button = tk.Button(self.config_frame, text="Load Selected Configuration")
         self.load_config_button.grid(row=2, column=0, padx=5, pady=5)
-        self.delete_config_button = tk.Button(self.config_frame, text="Delete Selected Configuration",
-                                              command=self.delete_selected_configuration)
+        self.delete_config_button = tk.Button(self.config_frame, text="Delete Selected Configuration")
         self.delete_config_button.grid(row=3, column=0, padx=5, pady=5)
-        self.rename_config_button = tk.Button(self.config_frame, text="Rename Selected Configuration",
-                                              command=self.rename_selected_configuration)
+        self.rename_config_button = tk.Button(self.config_frame, text="Rename Selected Configuration")
         self.rename_config_button.grid(row=4, column=0, padx=5, pady=5)
+        self.config_manager = ConfigurationManager(
+            self.config_listbox, self.sliders, self.leap_node, self.move_to_pose)
+        self.save_config_button.config(command=self.config_manager.save_current_configuration)
+        self.load_config_button.config(command=self.config_manager.load_selected_configuration)
+        self.delete_config_button.config(command=self.config_manager.delete_selected_configuration)
+        self.rename_config_button.config(command=self.config_manager.rename_selected_configuration)
 
-        self.load_configurations()
-        self.update_config_listbox()
-
-        # --- GUI for Velocity Control ---
+        # --- Velocity Control ---
         self.vel_frame = tk.Frame(self.left_frame)
         self.vel_frame.pack(padx=5, pady=5)
-        vel_label = tk.Label(self.vel_frame, text="Set Velocity (rad/s)")
-        vel_label.pack(side=tk.LEFT, padx=5)
+        tk.Label(self.vel_frame, text="Set Velocity (rad/s)").pack(side=tk.LEFT, padx=5)
         self.vel_slider = tk.Scale(self.vel_frame, from_=0, to=5, resolution=0.1,
                                    orient=tk.HORIZONTAL, length=300, command=self.velocity_changed)
         self.vel_slider.set(0)
         self.vel_slider.pack(side=tk.LEFT, padx=5)
 
-        self.update_current_positions()
+        # --- Trajectory Controls & Library ---
+        traj_ctrl_frame = tk.Frame(self.left_frame)
+        traj_ctrl_frame.pack(padx=5, pady=5)
+        self.start_rec_button = tk.Button(traj_ctrl_frame, text="Start Recording")
+        self.start_rec_button.pack(side=tk.LEFT, padx=5)
+        self.stop_rec_button = tk.Button(traj_ctrl_frame, text="Stop Recording", state=tk.DISABLED)
+        self.stop_rec_button.pack(side=tk.LEFT, padx=5)
+        traj_lib_frame = tk.Frame(self.left_frame)
+        traj_lib_frame.pack(padx=5, pady=5, fill=tk.X)
+        tk.Label(traj_lib_frame, text="Trajectory Library:", font=("Arial", 10, "bold")).pack(anchor="w")
+        self.traj_listbox = tk.Listbox(traj_lib_frame, height=4, width=40)
+        self.traj_listbox.pack(side=tk.LEFT, padx=5, pady=5)
+        traj_btn_frame = tk.Frame(traj_lib_frame)
+        traj_btn_frame.pack(side=tk.LEFT, padx=5, pady=5)
+        self.play_traj_button = tk.Button(traj_btn_frame, text="Play Selected Trajectory")
+        self.play_traj_button.pack(pady=2)
+        self.pause_traj_button = tk.Button(traj_btn_frame, text="Pause", state=tk.DISABLED)
+        self.pause_traj_button.pack(pady=2)
+        self.delete_traj_button = tk.Button(traj_btn_frame, text="Delete Selected Trajectory")
+        self.delete_traj_button.pack(pady=2)
+        self.trajectory_manager = TrajectoryManager(
+            master=self.master,
+            leap_node=self.leap_node,
+            stream_width_var=self.stream_width_var,
+            stream_height_var=self.stream_height_var,
+            start_rec_button=self.start_rec_button,
+            stop_rec_button=self.stop_rec_button,
+            traj_listbox=self.traj_listbox
+        )
+        self.trajectory_manager.set_hand_pose_callback = lambda pose: self.move_to_pose(np.array(pose))
+        self.trajectory_manager.get_tactile_frame_callback = lambda finger: self.sensor_manager.get_realsense_frame()
+        self.trajectory_manager.replay_panel_show_callback = lambda: None
+        self.trajectory_manager.pause_traj_button_callback = lambda state, text: (
+            self.pause_traj_button.config(state=tk.NORMAL if state == "normal" else tk.DISABLED, text=text)
+        )
+        self.trajectory_manager.update_replay_camera_callback = lambda cam_path: self.update_playback_image("Camera", cam_path)
+        self.trajectory_manager.update_replay_tactile_callback = lambda finger, path: self.update_playback_image(finger, path)
+        self.play_traj_button.config(
+            command=lambda: threading.Thread(
+                target=self.trajectory_manager.play_trajectory,
+                args=(self.traj_listbox.curselection()[0] if self.traj_listbox.curselection() else None,),
+                daemon=True
+            ).start()
+        )
+        self.pause_traj_button.config(command=self.trajectory_manager.toggle_pause)
+        self.delete_traj_button.config(
+            command=lambda: self.trajectory_manager.delete_trajectory(
+                self.traj_listbox.curselection()[0] if self.traj_listbox.curselection() else None
+            )
+        )
 
-        # --------------------------
-        # Right Frame: Sensor Streams
-        # --------------------------
-        # Create a subframe at the top of the right frame to let the user choose stream sizes.
+        # -------------------------
+        # RIGHT SIDE – Live & Playback Streams
+        # -------------------------
+        self.live_frame = tk.Frame(self.right_frame)
+        self.live_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        self.playback_frame = tk.Frame(self.right_frame)
+        self.playback_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        self.stream_names = ["Camera", "Thumb", "Index", "Middle", "Ring"]
+        self.live_labels = {}
+        self.playback_labels = {}
+
+        for i, stream in enumerate(self.stream_names):
+            live_col_frame = tk.Frame(self.live_frame, borderwidth=2, relief=tk.GROOVE)
+            live_col_frame.grid(row=0, column=i, padx=5, sticky="n")
+            tk.Label(live_col_frame, text=stream, font=("Arial", 12, "bold")).pack(side=tk.TOP, pady=2)
+            self.live_labels[stream] = tk.Label(
+                live_col_frame, text="LIVE", bg="black",
+                width=self.stream_width_var.get(), height=self.stream_height_var.get(), fg="red"
+            )
+            self.live_labels[stream].pack(side=tk.TOP, pady=5)
+
+        for i, stream in enumerate(self.stream_names):
+            playback_col_frame = tk.Frame(self.playback_frame, borderwidth=2, relief=tk.GROOVE)
+            playback_col_frame.grid(row=0, column=i, padx=5, sticky="n")
+            tk.Label(playback_col_frame, text=stream, font=("Arial", 12, "bold")).pack(side=tk.TOP, pady=2)
+            label = tk.Label(
+                playback_col_frame, bg="gray",
+                width=self.stream_width_var.get(), height=self.stream_height_var.get()
+            )
+            # Do not pack playback label initially.
+            self.playback_labels[stream] = label
+
+        def update_live_image(stream, image):
+            try:
+                img = Image.fromarray(image)
+                img = img.resize((self.stream_width_var.get(), self.stream_height_var.get()),
+                                 Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                self.live_labels[stream].config(image=photo)
+                self.live_labels[stream].image = photo
+            except Exception as e:
+                print(f"Error updating live image for {stream}: {e}")
+
+        def update_playback_image(stream, image_path):
+            try:
+                img = Image.open(image_path)
+                img = img.resize((self.stream_width_var.get(), self.stream_height_var.get()),
+                                 Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                label = self.playback_labels[stream]
+                if not label.winfo_ismapped():
+                    label.pack(side=tk.TOP, pady=5)
+                label.config(image=photo)
+                label.image = photo
+            except Exception as e:
+                print(f"Error updating playback image for {stream}: {e}")
+
+        self.update_live_image = update_live_image
+        self.update_playback_image = update_playback_image
+
+        # ----- Sensor Manager Setup -----
+        self.sensor_manager = SensorManager(self.master, self.stream_width_var, self.stream_height_var)
+        self.sensor_manager.live_update_callback = lambda frame: self.update_live_image("Camera", frame)
+        self.sensor_manager.tactile_live_update_callback = lambda finger, frame: self.update_live_image(finger, frame)
+        self.sensor_manager.setup_digit_sensors(self.right_frame)
+        self.sensor_manager.setup_realsense_stream(self.right_frame)
+
+        # Spinboxes for resizing streams.
         self.size_frame = tk.Frame(self.right_frame)
         self.size_frame.pack(side=tk.TOP, padx=5, pady=5)
         tk.Label(self.size_frame, text="Stream Width:").pack(side=tk.LEFT)
-        self.stream_width_spin = tk.Spinbox(self.size_frame, from_=160, to=1280, increment=16, textvariable=self.stream_width_var, width=5, command=self.update_stream_dimensions)
-        self.stream_width_spin.pack(side=tk.LEFT, padx=5)
+        tk.Spinbox(
+            self.size_frame, from_=160, to=1280, increment=16,
+            textvariable=self.stream_width_var, width=5, command=self.update_stream_dimensions
+        ).pack(side=tk.LEFT, padx=5)
         tk.Label(self.size_frame, text="Stream Height:").pack(side=tk.LEFT)
-        self.stream_height_spin = tk.Spinbox(self.size_frame, from_=120, to=720, increment=16, textvariable=self.stream_height_var, width=5, command=self.update_stream_dimensions)
-        self.stream_height_spin.pack(side=tk.LEFT, padx=5)
+        tk.Spinbox(
+            self.size_frame, from_=120, to=720, increment=16,
+            textvariable=self.stream_height_var, width=5, command=self.update_stream_dimensions
+        ).pack(side=tk.LEFT, padx=5)
 
-        # Create a frame that holds two subframes: one for DIGIT sensors and one for the RealSense camera.
-        self.sensor_right_frame = tk.Frame(self.right_frame)
-        self.sensor_right_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.update_current_positions()
 
-        # --- DIGIT Sensor Streams ---
-        # Create a frame that will contain the two tactile columns.
-        self.digit_frame = tk.Frame(self.right_frame)
-        self.digit_frame.pack(padx=5, pady=5, fill=tk.BOTH, expand=True)
-        digit_title = tk.Label(self.digit_frame, text="DIGIT Sensor Streams", font=("Arial", 14, "bold"))
-        digit_title.pack(pady=5)
-
-        # Create two subframes for two columns.
-        self.tactile_left_frame = tk.Frame(self.digit_frame)
-        self.tactile_left_frame.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.BOTH, expand=True)
-        self.tactile_right_frame = tk.Frame(self.digit_frame)
-        self.tactile_right_frame.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.BOTH, expand=True)
-
-        # Hardcoded sensor serial numbers for each finger.
-        finger_sensor_serials = {
-            "Thumb": "D21133",
-            "Index": "D21117",
-            "Middle": "D21131",
-            "Ring": "D20844"
-        }
-        self.sensors = {}  # key: finger name, value: Digit object
-        self.sensor_labels = {}  # key: finger name, value: tk.Label for image display
-
-        from digit_interface import Digit
-        for finger, serial in finger_sensor_serials.items():
-            try:
-                sensor = Digit(serial)
-                sensor.connect()
-                self.sensors[finger] = sensor
-
-                # Choose the column based on finger name.
-                container_parent = self.tactile_left_frame if finger in ["Index",
-                                                                         "Middle"] else self.tactile_right_frame
-
-                container = tk.Frame(container_parent, bd=2, relief=tk.RIDGE)
-                container.pack(padx=5, pady=5)
-                # Create a static label with the finger name.
-                name_lbl = tk.Label(container, text=finger, font=("Arial", 12, "bold"))
-                name_lbl.pack(side=tk.TOP, pady=(2, 0))
-                # Create the image label with fixed dimensions.
-                img_lbl = tk.Label(container, bg="black", width=self.stream_width_var.get(),
-                                   height=self.stream_height_var.get())
-                img_lbl.pack(side=tk.TOP, pady=(0, 2))
-                # Optional: a "Show View" button for the sensor.
-                view_btn = tk.Button(container, text="Show View",
-                                     command=lambda f=finger: threading.Thread(target=self.show_sensor_view, args=(f,),
-                                                                               daemon=True).start())
-                view_btn.pack(side=tk.TOP, pady=(0, 2))
-                self.sensor_labels[finger] = img_lbl
-            except Exception as e:
-                err_lbl = tk.Label(self.digit_frame, text=f"Error connecting {finger} sensor ({serial}): {e}")
-                err_lbl.pack(pady=2)
-
-        # --- RealSense Camera Stream ---
-        self.camera_frame = tk.Frame(self.sensor_right_frame, bd=2, relief=tk.RIDGE)
-        self.camera_frame.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.BOTH, expand=True)
-        camera_title = tk.Label(self.camera_frame, text="RealSense D435 RGB Stream", font=("Arial", 14, "bold"))
-        camera_title.pack(pady=5)
-        self.camera_label = tk.Label(self.camera_frame, bg="black")
-        self.camera_label.pack(padx=5, pady=5)
-
-        # Start update loops in separate threads.
-        threading.Thread(target=self.update_sensor_images, daemon=True).start()
-        threading.Thread(target=self.update_camera_stream, daemon=True).start()
 
     def update_stream_dimensions(self):
-        # This method is called when the user changes the stream dimensions.
-        # It does not need to update the labels directly; the update loops will use the new dimensions.
-        pass  # We use the spinbox variable values in the update functions.
+        width = self.stream_width_var.get()
+        height = self.stream_height_var.get()
+        for stream in self.stream_names:
+            self.live_labels[stream].config(width=width, height=height)
+            self.playback_labels[stream].config(width=width, height=height)
+        print(f"[INFO] Stream dimensions updated: {width}x{height}")
 
-    def move_to_pose(self, target_pose, steps=50, delay=50):
-        current_pose = self.leap_node.curr_pos.copy()
-        for i in range(1, steps + 1):
-            interp_pose = current_pose + (target_pose - current_pose) * (i / steps)
-            self.leap_node.set_leap(interp_pose)
-            time.sleep(delay / 1000.0)
+    def update_slider_positions(self):
+        try:
+            current_pose_deg = np.rad2deg(self.leap_node.read_pos())
+            for i, slider in enumerate(self.sliders):
+                slider.set(current_pose_deg[i])
+        except Exception as e:
+            print(f"Slider update failed: {e}")
+        self.master.after(500, self.update_slider_positions)
 
-    def slider_changed(self, value):
+    def slider_changed(self, _):
+        if hasattr(self, "_last_slider_time") and time.time() - self._last_slider_time < 0.05:
+            return
+        self._last_slider_time = time.time()
         angles_deg = np.array([slider.get() for slider in self.sliders])
         angles_rad = np.deg2rad(angles_deg)
         self.leap_node.set_leap(angles_rad)
 
     def read_positions(self):
         try:
-            pos_rad = self.leap_node.read_pos()
-            pos_deg = np.rad2deg(pos_rad)
-            pos_text = ", ".join(f"{p:.1f}" for p in pos_deg)
-            self.current_positions_label.config(text="Current Positions: " + pos_text)
+            return self.leap_node.read_pos()
         except Exception as e:
-            self.current_positions_label.config(text="Error reading positions: " + str(e))
+            print("Error reading positions:", e)
+            return None
 
     def update_current_positions(self):
         self.read_positions()
         self.master.after(1000, self.update_current_positions)
 
-    # ---------- Finger Teach Mode Methods ----------
-    def toggle_finger_teach_mode(self, finger):
-        if not self.finger_teach_modes[finger]:
-            self.finger_teach_modes[finger] = True
-            self.finger_teach_buttons[finger].config(text=f"{finger}: Exit Teach Mode & Capture")
-            self.finger_teach_status[finger].config(text="Teach Mode Active")
-            self.update_finger_teach_mode(finger)
-        else:
-            self.finger_teach_modes[finger] = False
-            captured_pose = self.leap_node.read_pos()
-            captured_pose_deg = np.rad2deg(captured_pose)
-            for i in self.fingers[finger]:
-                self.sliders[i].set(captured_pose_deg[i])
-            self.finger_teach_buttons[finger].config(text=f"{finger}: Enter Teach Mode")
-            self.finger_teach_status[finger].config(text="Normal")
+    def move_to_pose(self, target_pose, steps=None, delay=None, override_safety=False):
+        """
+        Smoothly moves the robot from its current pose to target_pose using S-curve interpolation.
+        Optional parameters (steps and delay) override global settings if provided.
+        The override_safety flag, if True, bypasses safety clipping.
 
-    def update_finger_teach_mode(self, finger):
-        if self.finger_teach_modes[finger]:
-            current_pose = self.leap_node.read_pos()
-            new_pose = self.leap_node.curr_pos.copy()
-            for i in self.fingers[finger]:
-                new_pose[i] = current_pose[i]
-            self.leap_node.set_leap(new_pose)
-            self.master.after(50, lambda: self.update_finger_teach_mode(finger))
+        This version temporarily sets a low velocity so that the motors move slowly.
+        """
+        # Get the current pose.
+        current_pose = self.leap_node.curr_pos.copy()
+        if steps is None:
+            steps = GLOBAL_SMOOTHING_STEPS
+        if delay is None:
+            delay = GLOBAL_SMOOTHING_DELAY
 
-    # ---------- Configuration Library Methods ----------
-    def load_configurations(self):
-        if os.path.exists("saved_configs.json"):
-            try:
-                with open("saved_configs.json", "r") as f:
-                    self.configurations = json.load(f)
-            except Exception as e:
-                print("Error loading configurations:", e)
-                self.configurations = []
-        else:
-            self.configurations = []
+        # --- New Code: Set a low velocity for the movement ---
+        # Adjust the value below as needed (e.g., 0.1 radians per second).
+        # low_velocity = 0.1
+        # self.leap_node.set_velocity(np.full(len(self.leap_node.motors), low_velocity))
 
-    def save_configurations(self):
-        try:
-            with open("saved_configs.json", "w") as f:
-                json.dump(self.configurations, f, indent=4)
-        except Exception as e:
-            print("Error saving configurations:", e)
+        # Pause the control loop so the smooth command is not overridden.
+        self.leap_node.pause_control_loop()
 
-    def update_config_listbox(self):
-        self.config_listbox.delete(0, tk.END)
-        for config in self.configurations:
-            self.config_listbox.insert(tk.END, config["name"])
+        # Perform smooth S-curve interpolation.
+        for i in range(1, steps + 1):
+            t = i / steps  # Normalized time in [0, 1]
+            s = 3 * (t ** 2) - 2 * (t ** 3)  # S-curve: smooth acceleration and deceleration.
+            interp_pose = current_pose + (target_pose - current_pose) * s
+            self.leap_node.set_leap(interp_pose, override_safety=override_safety)
+            time.sleep(delay / 1000.0)
 
-    def save_current_configuration(self):
-        name = simpledialog.askstring("Save Configuration", "Enter configuration name:")
-        if name:
-            pose_rad = self.leap_node.read_pos()
-            pose_deg = np.rad2deg(pose_rad).tolist()
-            config = {"name": name, "pose": pose_deg}
-            self.configurations.append(config)
-            self.save_configurations()
-            self.update_config_listbox()
+        # Resume the control loop to hold the new pose.
+        self.leap_node.resume_control_loop()
 
-    def load_selected_configuration(self):
-        selected_index = self.config_listbox.curselection()
-        if selected_index:
-            config = self.configurations[selected_index[0]]
-            target_pose = np.deg2rad(np.array(config["pose"]))
-            self.move_to_pose(target_pose, steps=50, delay=50)
-            loaded_pose_deg = np.rad2deg(target_pose)
-            for i, slider in enumerate(self.sliders):
-                slider.set(loaded_pose_deg[i])
-
-    def delete_selected_configuration(self):
-        selected_index = self.config_listbox.curselection()
-        if selected_index:
-            confirm = messagebox.askyesno("Delete Configuration",
-                                          "Are you sure you want to delete the selected configuration?")
-            if confirm:
-                del self.configurations[selected_index[0]]
-                self.save_configurations()
-                self.update_config_listbox()
-
-    def rename_selected_configuration(self):
-        selected_index = self.config_listbox.curselection()
-        if selected_index:
-            new_name = simpledialog.askstring("Rename Configuration", "Enter the new configuration name:")
-            if new_name:
-                self.configurations[selected_index[0]]["name"] = new_name
-                self.save_configurations()
-                self.update_config_listbox()
-
-    # ---------- New: Velocity Control Method ----------
     def velocity_changed(self, value):
         try:
             vel = float(value)
@@ -335,72 +342,25 @@ class LeapHandGUI:
         except Exception as e:
             print("Error setting velocity:", e)
 
-    # ---------- New: Sensor Image Update for DIGIT ----------
-    def update_sensor_images(self):
-        """
-        Continuously update the DIGIT sensor images.
-        For each sensor, get the current frame, resize it according to the current
-        stream dimensions, convert it to a PhotoImage, and update its corresponding label.
-        """
-        while True:
-            width = self.stream_width_var.get()
-            height = self.stream_height_var.get()
-            for finger, sensor in self.sensors.items():
-                try:
-                    frame = sensor.get_frame()  # Expected to return a NumPy array (H x W x 3)
-                    img = Image.fromarray(frame)
-                    img = img.resize((width, height))
-                    photo = ImageTk.PhotoImage(img)
-                    self.master.after(0, lambda p=photo, f=finger: self.sensor_labels[f].config(image=p))
-                    self.sensor_labels[finger].image = photo
-                except Exception as e:
-                    print(f"Error streaming {finger} sensor: {e}")
-            time.sleep(0.03)
-
-    # ---------- New: RealSense Camera Stream ----------
-    def update_camera_stream(self):
-        pipeline = rs.pipeline()
-        config = rs.config()
-        width = self.stream_width_var.get()
-        height = self.stream_height_var.get()
-        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, 30)
-        pipeline.start(config)
-        try:
-            while True:
-                frames = pipeline.wait_for_frames()
-                color_frame = frames.get_color_frame()
-                if not color_frame:
-                    continue
-                img = np.asanyarray(color_frame.get_data())
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                photo = ImageTk.PhotoImage(Image.fromarray(img))
-                self.master.after(0, lambda p=photo: self.camera_label.config(image=p))
-                self.camera_label.image = photo
-                time.sleep(0.03)
-        finally:
-            pipeline.stop()
-
-    # ---------- New: Show View Button Callback for DIGIT ----------
-    def show_sensor_view(self, finger):
-        try:
-            self.sensors[finger].show_view()
-        except Exception as e:
-            print(f"Error showing view for {finger} sensor: {e}")
-
-    # ---------- Safe Shutdown ----------
     def on_closing(self):
+        """
+        On shutdown, smoothly move to the safe (flat) pose using slower parameters and override safety,
+        then disable torque, disconnect sensors, and close the GUI.
+        """
         flat_pose_rad = lhu.allegro_to_LEAPhand(np.zeros(16))
         flat_pose_deg = np.rad2deg(flat_pose_rad)
         for idx in [1, 5, 9]:
             flat_pose_deg[idx] = 94
-        target_pose = np.deg2rad(flat_pose_deg)
-        self.move_to_pose(target_pose, steps=50, delay=50)
-        self.leap_node.dxl_client.set_torque_enabled(self.leap_node.motors, False)
-        for finger, sensor in self.sensors.items():
-            try:
-                sensor.disconnect()
-            except Exception as e:
-                print(f"Error disconnecting {finger} sensor: {e}")
+        safe_pose = np.deg2rad(flat_pose_deg)
+        self.move_to_pose(safe_pose, override_safety=True)
+        try:
+            self.leap_node.dxl_client.set_torque_enabled(self.leap_node.motors, False)
+        except Exception as e:
+            print("Error disabling torque:", e)
+        try:
+            self.sensor_manager.disconnect_all()
+        except Exception as e:
+            print("Error disconnecting sensors:", e)
         self.master.destroy()
 
 def main():
