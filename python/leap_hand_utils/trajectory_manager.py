@@ -1,4 +1,3 @@
-# trajectory_manager.py
 import os
 import time
 import json
@@ -9,14 +8,12 @@ import numpy as np
 from PIL import Image, ImageTk
 import tkinter as tk
 import tkinter.simpledialog as simpledialog
-import pyrealsense2 as rs
 
 class TrajectoryManager:
     def __init__(self, master, leap_node, stream_width_var, stream_height_var,
                  start_rec_button, stop_rec_button, traj_listbox):
         """
         Initialize the TrajectoryManager.
-
         Parameters:
             master: The TK root window.
             leap_node: The LEAP hand controller.
@@ -43,28 +40,39 @@ class TrajectoryManager:
         self.middle_folder = None
         self.ring_folder = None
 
-        # Trajectory library (persisted on disk)
         self.trajectory_library = []
         self.trajectory_library_file = "trajectory_library.json"
         self.playing_paused = False
 
-        # Load saved trajectories.
-        self.load_trajectory_library()
-        self.update_traj_listbox()
+        self.recording_thread = None
+        self.playback_speed = 1.0
 
-        # Callback attributes – to be set by the GUI.
+        # Callback for updating playback progress (0 to 100)
+        self.progress_update_callback = None
+
+        # Callback to get the camera frame from the live stream.
+        self.get_camera_frame_callback = None
+
+        # Callback for tactile frame acquisition.
         self.get_tactile_frame_callback = None
+
+        # Callbacks for other functionality.
         self.set_hand_pose_callback = None
         self.replay_panel_show_callback = None
         self.pause_traj_button_callback = None
         self.update_replay_camera_callback = None
         self.update_replay_tactile_callback = None
 
+        # Load saved trajectories.
+        self.load_trajectory_library()
+        self.update_traj_listbox()
+
     def load_trajectory_library(self):
         if os.path.exists(self.trajectory_library_file):
             try:
                 with open(self.trajectory_library_file, "r") as f:
                     self.trajectory_library = json.load(f)
+                # Keep only trajectories whose folders exist.
                 self.trajectory_library = [traj for traj in self.trajectory_library
                                            if os.path.exists(traj.get("folder", ""))]
                 print("Loaded trajectory library from disk.")
@@ -120,16 +128,37 @@ class TrajectoryManager:
         self.start_rec_button.config(state=tk.DISABLED)
         self.stop_rec_button.config(state=tk.NORMAL)
         print(f"Started recording trajectory in folder: {os.path.abspath(self.current_traj_folder)}")
-        threading.Thread(target=self.record_trajectory, daemon=True).start()
+        self.recording_thread = threading.Thread(target=self.record_trajectory, daemon=True)
+        self.recording_thread.start()
 
     def stop_recording(self):
         if not self.recording:
             return
+        # Signal to stop further data recording
         self.recording = False
+        # Immediately update the UI buttons
         self.start_rec_button.config(state=tk.NORMAL)
         self.stop_rec_button.config(state=tk.DISABLED)
-        print("Stopped recording trajectory.")
+        print("Recording stopped; waiting for data capture to finish...")
+
+        # Poll until the recording thread has finished, then prompt for a name.
+        def wait_for_thread():
+            if self.recording_thread.is_alive():
+                self.master.after(50, wait_for_thread)
+            else:
+                # Now that no more data is being recorded, prompt for a trajectory name.
+                self.post_recording_process()
+
+        wait_for_thread()
+
+    def post_recording_process(self):
+        print("Recording thread finished. Processing recorded data.")
         if not self.trajectory:
+            try:
+                shutil.rmtree(self.current_traj_folder)
+                print(f"Trajectory discarded and folder {os.path.abspath(self.current_traj_folder)} deleted.")
+            except Exception as e:
+                print("Error deleting temporary folder:", e)
             return
         final_name = simpledialog.askstring("Save Trajectory", "Enter a name for this trajectory:")
         if final_name:
@@ -159,25 +188,20 @@ class TrajectoryManager:
                 print(f"Error deleting temporary folder: {e}")
 
     def record_trajectory(self):
-        pipeline = rs.pipeline()
-        config = rs.config()
-        width = self.stream_width_var.get()
-        height = self.stream_height_var.get()
-        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, 30)
-        pipeline.start(config)
         sample_index = 0
         try:
             while self.recording:
                 elapsed = time.time() - self.record_start_time
-                current_config = self.leap_node.read_pos()
-                config_list = current_config.tolist()
-                frames = pipeline.wait_for_frames()
-                color_frame = frames.get_color_frame()
-                if color_frame:
-                    cam_img = np.asanyarray(color_frame.get_data())
-                    cam_filename = f"{sample_index:05d}.jpg"
-                    cam_path = os.path.join(self.camera_folder, cam_filename)
-                    cv2.imwrite(cam_path, cam_img)
+                config_list = self.leap_node.read_pos().tolist()
+                # Get the latest camera frame via the callback.
+                if self.get_camera_frame_callback:
+                    cam_img = self.get_camera_frame_callback()
+                    if cam_img is not None:
+                        cam_filename = f"{sample_index:05d}.jpg"
+                        cam_path = os.path.join(self.camera_folder, cam_filename)
+                        cv2.imwrite(cam_path, cam_img)
+                    else:
+                        cam_filename = ""
                 else:
                     cam_filename = ""
                 tactile_filenames = {}
@@ -206,19 +230,17 @@ class TrajectoryManager:
                 print(f"Recorded sample {sample_index} at {elapsed:.2f} sec")
                 sample_index += 1
                 time.sleep(0.1)
+        except Exception as e:
+            print("Error during recording:", e)
         finally:
-            pipeline.stop()
-        json_path = os.path.join(self.current_traj_folder, "trajectory_data.json")
-        with open(json_path, "w") as f:
-            json.dump(self.trajectory, f, indent=4)
-        print(f"Saved trajectory JSON: {os.path.abspath(json_path)}")
-        traj_entry = {"name": os.path.basename(self.current_traj_folder),
-                      "folder": self.current_traj_folder,
-                      "trajectory": self.trajectory}
-        self.trajectory_library.append(traj_entry)
-        self.update_traj_listbox()
-        self.save_trajectory_library()
-        print("Trajectory recording finished and saved.")
+            json_path = os.path.join(self.current_traj_folder, "trajectory_data.json")
+            try:
+                with open(json_path, "w") as f:
+                    json.dump(self.trajectory, f, indent=4)
+                print(f"Saved trajectory JSON: {os.path.abspath(json_path)}")
+            except Exception as e:
+                print("Error saving trajectory JSON:", e)
+            print("Trajectory recording finished.")
 
     def sleep_with_pause(self, duration):
         remaining = duration
@@ -230,7 +252,6 @@ class TrajectoryManager:
                 time.sleep(dt)
                 remaining -= dt
 
-    # Modification: Default argument for selected_index
     def play_trajectory(self, selected_index=None):
         if selected_index is None or selected_index < 0 or selected_index >= len(self.trajectory_library):
             print("No valid trajectory selected.")
@@ -251,15 +272,24 @@ class TrajectoryManager:
         if self.replay_panel_show_callback:
             self.replay_panel_show_callback()
 
-        print(f"Playing trajectory '{traj_entry['name']}'...")
-        self.playing_paused = False
+        print(f"Playing trajectory '{traj_entry['name']}' at speed factor {self.playback_speed}...")
+        # Adjust the timeline: compute adjusted timestamps.
+        start_ts = traj[0]["timestamp"]
+        for sample in traj:
+            sample["adjusted_ts"] = (sample["timestamp"] - start_ts) / self.playback_speed
+
+        start_playback = time.time()
         if self.pause_traj_button_callback:
             self.pause_traj_button_callback(state="normal", text="Pause")
-        prev_time = traj[0]["timestamp"]
-        for sample in traj:
-            timestamp = sample["timestamp"]
-            delay = timestamp - prev_time
-            self.sleep_with_pause(delay)
+        total_samples = len(traj)
+        for i, sample in enumerate(traj):
+            target_time = sample["adjusted_ts"]
+            now = time.time() - start_playback
+            delay = target_time - now
+            # Enforce a minimum delay (e.g., 50 ms) even if playback speed is high.
+            delay = max(delay, 0.05)
+            if delay > 0:
+                self.sleep_with_pause(delay)
             config = sample["configuration"]
             if self.set_hand_pose_callback:
                 self.set_hand_pose_callback(config)
@@ -274,10 +304,14 @@ class TrajectoryManager:
                     tactile_path = os.path.join(traj_folder, finger.lower(), fname)
                     if os.path.exists(tactile_path) and self.update_replay_tactile_callback:
                         self.update_replay_tactile_callback(finger, tactile_path)
-            prev_time = timestamp
+            if self.progress_update_callback:
+                progress_value = int((i + 1) / total_samples * 100)
+                self.progress_update_callback(progress_value)
+            while self.playing_paused:
+                time.sleep(0.1)
         print("Trajectory playback finished.")
         if self.pause_traj_button_callback:
-            self.pause_traj_button_callback(state="disabled")
+            self.pause_traj_button_callback(state="disabled", text="Pause")
 
     def toggle_pause(self):
         self.playing_paused = not self.playing_paused

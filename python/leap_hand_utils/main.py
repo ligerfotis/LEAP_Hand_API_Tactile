@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from leap_hand_gui import LeapHandGUI
+from leap_hand_gui_new import LeapHandGUI
 import tkinter as tk
 
 def main():
