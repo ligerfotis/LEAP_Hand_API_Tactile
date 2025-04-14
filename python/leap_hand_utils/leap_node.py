@@ -6,12 +6,11 @@ import numpy as np
 
 class LeapNode:
     def __init__(self):
-        self.kP = 1500
+        self.kP = 1000
         self.kI = 0
         self.kD = 200
         self.curr_lim = 550
-        self.prev_pos = self.pos = self.curr_pos = None  # Will be initialized later
-
+        self.prev_pos = self.pos = self.curr_pos = None  # to be initialized
         self.motors = list(range(16))
         self.write_lock = threading.Lock()
 
@@ -29,12 +28,9 @@ class LeapNode:
         self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * 5, 11, 1)
         self.dxl_client.set_torque_enabled(self.motors, True)
         self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * self.kP, 84, 2)
-        # self.dxl_client.sync_write([0, 4, 8], np.ones(3) * (self.kP), 84, 2)
         self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * self.kI, 82, 2)
         self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * self.kD, 80, 2)
-        # self.dxl_client.sync_write([0, 4, 8], np.ones(3) * (self.kD), 80, 2)
         self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * self.curr_lim, 102, 2)
-
         self.control_loop_running = False
 
     def initialize_current_pose_from_motors(self):
@@ -81,6 +77,13 @@ class LeapNode:
             self.curr_pos = np.array(pose)
             self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
 
+    def set_velocity(self, velocities):
+        """Command the motors with desired velocities (in rad/s)."""
+        with self.write_lock:
+            self.prev_pos = self.curr_pos
+            self.curr_pos = np.array(velocities)  # For record keeping; these are velocity commands
+            self.dxl_client.write_desired_vel(self.motors, velocities)
+
     def read_pos(self):
         return self.dxl_client.read_pos()
 
@@ -100,12 +103,9 @@ class LeapNode:
         teach_kP = self.kP // 2
         teach_kD = self.kD // 2
         self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * teach_kP, 84, 2)
-        # self.dxl_client.sync_write([0, 4, 8], np.ones(3) * (teach_kP * 0.75), 84, 2)
         self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * teach_kD, 80, 2)
-        # self.dxl_client.sync_write([0, 4, 8], np.ones(3) * (teach_kD * 0.75), 80, 2)
 
     def restore_normal_mode(self):
         self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * self.kP, 84, 2)
-        # self.dxl_client.sync_write([0, 4, 8], np.ones(3) * (self.kP * 0.75), 84, 2)
+        self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * self.kI, 82, 2)
         self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * self.kD, 80, 2)
-        # self.dxl_client.sync_write([0, 4, 8], np.ones(3) * (self.kD * 0.75), 80, 2)
