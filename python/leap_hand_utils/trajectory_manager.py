@@ -33,7 +33,6 @@ class TrajectoryManager:
         self.index_folder = None
         self.middle_folder = None
         self.ring_folder = None
-        self.post_process_called = False
 
         self.trajectory_library = []
         self.trajectory_library_file = "trajectory_library.json"
@@ -59,9 +58,45 @@ class TrajectoryManager:
 
         # Flag for random mode.
         self.random_mode = False
+        self.post_process_called = False
+
+        # --- New variables for touch detection ---
+        self.contact_threshold = 100  # set your threshold (calibrate as needed)
+        self.finger_motor_map = {
+            "Thumb": [12, 13, 14, 15],
+            "Index": [0, 1, 2, 3],
+            "Middle": [4, 5, 6, 7],
+            "Ring": [8, 9, 10, 11]
+        }
+        # --- For the contraction of the fingertips ---
+        # For each finger, we assume that contracting the DIP joint (last joint) brings the fingertip closer to the palm.
+        self.contraction_offset = 0.5  # radians; adjust based on your robot morphology
 
         self.load_trajectory_library()
         self.update_traj_listbox()
+
+    def detect_contact(self):
+        """Return a dictionary mapping each finger to 1 (contact) or 0 (no contact) based on current."""
+        contact = {}
+        try:
+            currents = self.leap_node.dxl_client.read_cur()
+            if currents is not None:
+                for finger, motor_ids in self.finger_motor_map.items():
+                    finger_currents = [currents[i] for i in motor_ids]
+                    avg_current = np.mean(finger_currents)
+                    if avg_current > self.contact_threshold:
+                        contact[finger] = 1
+                        print(f"Contact detected on {finger} (avg current: {avg_current:.2f})")
+                    else:
+                        contact[finger] = 0
+            else:
+                for finger in self.finger_motor_map:
+                    contact[finger] = 0
+        except Exception as e:
+            print("Error detecting contact:", e)
+            for finger in self.finger_motor_map:
+                contact[finger] = 0
+        return contact
 
     def load_trajectory_library(self):
         if os.path.exists(self.trajectory_library_file):
@@ -90,17 +125,14 @@ class TrajectoryManager:
             self.traj_listbox.insert(tk.END, traj["name"])
 
     def refresh_trajectory_library(self):
-        """Scan the datasets folders for both normal and random play trajectories."""
         new_library = []
         datasets_dir = os.path.join(os.getcwd(), "datasets")
-        # Normal trajectories (folders that do NOT start with "_random_play").
         if os.path.exists(datasets_dir):
             for folder_name in os.listdir(datasets_dir):
                 folder_path = os.path.join(datasets_dir, folder_name)
                 if os.path.isdir(folder_path) and not folder_name.startswith("_random_play"):
                     if os.path.exists(os.path.join(folder_path, "trajectory_data.json")):
                         new_library.append({"name": folder_name, "folder": folder_path})
-        # Random play trajectories.
         random_dir = os.path.join(datasets_dir, "random_play")
         if os.path.exists(random_dir):
             for folder_name in os.listdir(random_dir):
@@ -126,7 +158,6 @@ class TrajectoryManager:
                 print("Error deleting trajectory:", e)
 
     def start_recording(self):
-        # Normal recording mode.
         if self.recording:
             return
         self.random_mode = False
@@ -184,14 +215,17 @@ class TrajectoryManager:
                     except Exception as e:
                         print(f"Error capturing {finger} sensor image: {e}")
                         tactile_filenames[finger] = ""
+                # Detect touch/contact for each finger.
+                contact = self.detect_contact()
                 sample_data = {
                     "timestamp": elapsed,
                     "configuration": config_list,
                     "camera_frame": cam_filename,
-                    "tactile_frames": tactile_filenames
+                    "tactile_frames": tactile_filenames,
+                    "contact": contact
                 }
                 self.trajectory.append(sample_data)
-                print(f"Recorded sample {sample_index} at {elapsed:.2f} sec")
+                print(f"Recorded sample {sample_index} at {elapsed:.2f} sec, contact: {contact}")
                 sample_index += 1
                 time.sleep(0.1)
         except Exception as e:
@@ -207,7 +241,6 @@ class TrajectoryManager:
             print("Trajectory recording finished.")
 
     def record_random_trajectory(self, duration_minutes, selected_fingers):
-        # Random play mode.
         if self.recording:
             return
         self.random_mode = True
@@ -240,9 +273,8 @@ class TrajectoryManager:
     def record_random_trajectory_thread(self, duration_seconds, selected_fingers):
         sample_index = 0
         start_time = time.time()
-        # *** Store the baseline configuration once at the start of random play ***
+        # Store a baseline configuration so that non-selected fingers remain constant.
         baseline_config = self.leap_node.read_pos().copy()
-
         # Mapping for finger joints.
         finger_joint_mapping = {
             "Thumb": [12, 13, 14, 15],
@@ -253,19 +285,27 @@ class TrajectoryManager:
         try:
             while self.recording and (time.time() - start_time) < duration_seconds:
                 elapsed = time.time() - self.record_start_time
-                # *** Use the baseline configuration instead of reading current positions ***
+                # Start from the baseline so that non-selected fingers are kept constant.
                 new_config = baseline_config.copy()
+                # Apply random deltas for selected fingers.
                 for finger in selected_fingers:
                     if finger in finger_joint_mapping:
                         for idx in finger_joint_mapping[finger]:
-                            delta = np.random.uniform(-0.1, 0.1)
+                            delta = np.random.uniform(-0.2, 0.2)
                             new_config[idx] += delta
-                # Clip the values to safe limits.
+                        # --- CONTRACT the DIP (fingertip) and MCP (Base) and PIP (Middle) joints ---
+                        dip_idx = finger_joint_mapping[finger][3]  # last joint is DIP
+                        mcp_idx = finger_joint_mapping[finger][1]
+                        pip_idx = finger_joint_mapping[finger][2]  # second joint is PIP
+
+                        new_config[dip_idx] += self.contraction_offset
+                        new_config[mcp_idx] += self.contraction_offset
+                        new_config[pip_idx] += self.contraction_offset * 1.5
+
                 new_config = lhu.angle_safety_clip(new_config)
                 if self.set_hand_pose_callback:
                     self.set_hand_pose_callback(new_config.tolist())
                 config_list = new_config.tolist()
-                # Capture camera frame if available.
                 if self.get_camera_frame_callback:
                     cam_img = self.get_camera_frame_callback()
                     if cam_img is not None:
@@ -276,7 +316,6 @@ class TrajectoryManager:
                         cam_filename = ""
                 else:
                     cam_filename = ""
-                # Capture tactile frames.
                 tactile_filenames = {}
                 for finger, folder in zip(["Thumb", "Index", "Middle", "Ring"],
                                           [self.thumb_folder, self.index_folder, self.middle_folder, self.ring_folder]):
@@ -292,14 +331,17 @@ class TrajectoryManager:
                     except Exception as e:
                         print(f"Error capturing {finger} sensor image: {e}")
                         tactile_filenames[finger] = ""
+                # Detect contact from current readings.
+                contact = self.detect_contact()
                 sample_data = {
                     "timestamp": elapsed,
                     "configuration": config_list,
                     "camera_frame": cam_filename,
-                    "tactile_frames": tactile_filenames
+                    "tactile_frames": tactile_filenames,
+                    "contact": contact
                 }
                 self.trajectory.append(sample_data)
-                print(f"Random play sample {sample_index} at {elapsed:.2f} sec")
+                print(f"Random play sample {sample_index} at {elapsed:.2f} sec, contact: {contact}")
                 sample_index += 1
                 time.sleep(0.1)
         except Exception as e:
@@ -345,25 +387,24 @@ class TrajectoryManager:
                 print("Error deleting temporary folder:", e)
             return
         if self.random_mode:
-            final_prefix = simpledialog.askstring("Random Play Naming",
-                                                  "Enter a prefix to prepend to the random play name (or leave empty to keep default):",
-                                                  parent=self.master)
-            if final_prefix:
-                base = os.path.basename(self.current_traj_folder)
-                new_name = final_prefix + "_" + base
-                new_folder = os.path.join(os.path.dirname(self.current_traj_folder), new_name)
-                try:
-                    os.rename(self.current_traj_folder, new_folder)
-                    self.current_traj_folder = new_folder
-                    print(f"Random play folder renamed to: {os.path.abspath(new_folder)}")
-                except Exception as e:
-                    print(f"Error renaming random play folder: {e}")
-            print(f"Random play trajectory recorded and saved in: {self.current_traj_folder}")
-            # Now reset the flag because we have processed random mode.
-            self.random_mode = False
+            def process_random_naming():
+                final_prefix = simpledialog.askstring("Random Play Naming",
+                    "Enter a prefix to prepend to the random play name (or leave empty to keep default):",
+                    parent=self.master)
+                if final_prefix:
+                    base = os.path.basename(self.current_traj_folder)
+                    new_name = final_prefix + "_" + base
+                    new_folder = os.path.join(os.path.dirname(self.current_traj_folder), new_name)
+                    try:
+                        os.rename(self.current_traj_folder, new_folder)
+                        self.current_traj_folder = new_folder
+                        print(f"Random play folder renamed to: {os.path.abspath(new_folder)}")
+                    except Exception as e:
+                        print(f"Error renaming random play folder: {e}")
+                print(f"Random play trajectory recorded and saved in: {self.current_traj_folder}")
+            self.master.after(0, process_random_naming)
         else:
-            final_name = simpledialog.askstring("Save Trajectory", "Enter a name for this trajectory:",
-                                                parent=self.master)
+            final_name = simpledialog.askstring("Save Trajectory", "Enter a name for this trajectory:", parent=self.master)
             if final_name:
                 new_folder = os.path.join(os.path.dirname(self.current_traj_folder), final_name)
                 base_new_folder = new_folder
