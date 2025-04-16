@@ -60,6 +60,10 @@ class TrajectoryManager:
         self.random_mode = False
         self.post_process_called = False
 
+        # New callbacks for GUI updates at the end of random play.
+        self.random_play_end_callback = None
+        self.return_to_initial_pose_callback = None
+
         # --- New variables for touch detection ---
         self.contact_threshold = 100  # set your threshold (calibrate as needed)
         self.finger_motor_map = {
@@ -161,6 +165,8 @@ class TrajectoryManager:
         if self.recording:
             return
         self.random_mode = False
+        # Reset post-process flag for a new recording session.
+        self.post_process_called = False
         temp_name = "traj_" + time.strftime("%Y%m%d_%H%M%S")
         datasets_dir = os.path.join(os.getcwd(), "datasets")
         os.makedirs(datasets_dir, exist_ok=True)
@@ -215,7 +221,6 @@ class TrajectoryManager:
                     except Exception as e:
                         print(f"Error capturing {finger} sensor image: {e}")
                         tactile_filenames[finger] = ""
-                # Detect touch/contact for each finger.
                 contact = self.detect_contact()
                 sample_data = {
                     "timestamp": elapsed,
@@ -243,8 +248,11 @@ class TrajectoryManager:
     def record_random_trajectory(self, duration_minutes, selected_fingers):
         if self.recording:
             return
+        # Reset post-processing flag for a new random play session.
+        self.post_process_called = False
         self.random_mode = True
         duration_seconds = duration_minutes * 60.0
+        self.random_duration_seconds = duration_seconds  # Save the total duration for random play
         base_dir = os.path.join(os.getcwd(), "datasets", "random_play")
         os.makedirs(base_dir, exist_ok=True)
         finger_letters = "".join(sorted([f[0].lower() for f in selected_fingers]))
@@ -285,22 +293,33 @@ class TrajectoryManager:
         try:
             while self.recording and (time.time() - start_time) < duration_seconds:
                 elapsed = time.time() - self.record_start_time
-                # Start from the baseline so that non-selected fingers are kept constant.
                 new_config = baseline_config.copy()
-                # Apply random deltas for selected fingers.
                 for finger in selected_fingers:
                     if finger in finger_joint_mapping:
                         for idx in finger_joint_mapping[finger]:
                             delta = np.random.uniform(-0.2, 0.2)
                             new_config[idx] += delta
-                        # --- CONTRACT the DIP (fingertip) and MCP (Base) and PIP (Middle) joints ---
-                        dip_idx = finger_joint_mapping[finger][3]  # last joint is DIP
+                        mpc_for_idx = finger_joint_mapping[finger][0]
                         mcp_idx = finger_joint_mapping[finger][1]
-                        pip_idx = finger_joint_mapping[finger][2]  # second joint is PIP
-
-                        new_config[dip_idx] += self.contraction_offset
-                        new_config[mcp_idx] += self.contraction_offset
-                        new_config[pip_idx] += self.contraction_offset * 1.5
+                        pip_idx = finger_joint_mapping[finger][2]
+                        dip_idx = finger_joint_mapping[finger][3]
+                        if finger == "Thumb":
+                            new_config[mpc_for_idx] += self.contraction_offset * 2.2
+                            new_config[dip_idx] += self.contraction_offset * 2
+                            new_config[pip_idx] += self.contraction_offset * 2
+                        elif finger == "Index":
+                            new_config[mcp_idx] += self.contraction_offset
+                            new_config[dip_idx] += self.contraction_offset
+                            new_config[pip_idx] += self.contraction_offset * 1.5
+                        elif finger == "Middle":
+                            new_config[mcp_idx] += self.contraction_offset
+                            new_config[dip_idx] += self.contraction_offset
+                            new_config[pip_idx] += self.contraction_offset * 1.5
+                        elif finger == "Ring":
+                            new_config[mpc_for_idx] -= self.contraction_offset * 0.5
+                            new_config[mcp_idx] += self.contraction_offset
+                            new_config[dip_idx] += self.contraction_offset
+                            new_config[pip_idx] += self.contraction_offset * 1.2
 
                 new_config = lhu.angle_safety_clip(new_config)
                 if self.set_hand_pose_callback:
@@ -331,7 +350,6 @@ class TrajectoryManager:
                     except Exception as e:
                         print(f"Error capturing {finger} sensor image: {e}")
                         tactile_filenames[finger] = ""
-                # Detect contact from current readings.
                 contact = self.detect_contact()
                 sample_data = {
                     "timestamp": elapsed,
@@ -341,9 +359,7 @@ class TrajectoryManager:
                     "contact": contact
                 }
                 self.trajectory.append(sample_data)
-                print(f"Random play sample {sample_index} at {elapsed:.2f} sec, contact: {contact}")
                 sample_index += 1
-                time.sleep(0.1)
         except Exception as e:
             print("Error during random recording:", e)
         finally:
@@ -370,8 +386,6 @@ class TrajectoryManager:
                 self.master.after(50, check_if_finished)
             else:
                 self.master.after(0, self.post_recording_process)
-                # if self.random_mode:
-                #     self.random_mode = False
         check_if_finished()
 
     def post_recording_process(self):
@@ -388,6 +402,9 @@ class TrajectoryManager:
             return
         if self.random_mode:
             def process_random_naming():
+                # Reset hand to its safe (initial) pose before prompting.
+                if self.return_to_initial_pose_callback:
+                    self.return_to_initial_pose_callback()
                 final_prefix = simpledialog.askstring("Random Play Naming",
                     "Enter a prefix to prepend to the random play name (or leave empty to keep default):",
                     parent=self.master)
@@ -402,6 +419,8 @@ class TrajectoryManager:
                     except Exception as e:
                         print(f"Error renaming random play folder: {e}")
                 print(f"Random play trajectory recorded and saved in: {self.current_traj_folder}")
+                if self.random_play_end_callback:
+                    self.random_play_end_callback()
             self.master.after(0, process_random_naming)
         else:
             final_name = simpledialog.askstring("Save Trajectory", "Enter a name for this trajectory:", parent=self.master)

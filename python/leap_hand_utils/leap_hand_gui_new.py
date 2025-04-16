@@ -75,33 +75,25 @@ class LeapHandGUI:
         # LEFT SIDE – Controls and Configuration
         # -------------------------
 
-        # --- Create a slider panel for position control, grouped by finger ---
-        # Using the provided names:
-        # finger_names = ["Index", "Middle", "Ring", "Thumb"]
-        # joint_names = ["MCP Side", "MCP Forward", "PIP", "DIP"]
         self.pos_slider_frame = tk.Frame(self.left_frame)
         self.pos_slider_frame.pack(padx=5, pady=5, fill=tk.X)
 
-        # Title spanning all columns.
         tk.Label(self.pos_slider_frame, text="Position Control", font=("Arial", 10, "bold")).grid(
             row=0, column=0, columnspan=5, pady=5)
 
         finger_names = ["Index", "Middle", "Ring", "Thumb"]
         joint_names  = ["MCP Side", "MCP Forward", "PIP", "DIP"]
-        self.sliders = [None] * 16  # Flat list for 16 sliders.
+        self.sliders = [None] * 16
 
-        # Create header row: leave column 0 for joint names.
         for col, finger in enumerate(finger_names):
             header = tk.Label(self.pos_slider_frame, text=finger, font=("Arial", 10, "bold"))
             header.grid(row=1, column=col+1, padx=5, pady=5)
 
-        # Create slider rows for each joint.
         for row, joint in enumerate(joint_names):
-            # Joint name label in column 0 (row offset by 2).
             joint_label = tk.Label(self.pos_slider_frame, text=joint, width=12)
             joint_label.grid(row=row+2, column=0, padx=5, pady=5)
             for col, finger in enumerate(finger_names):
-                joint_index = col * 4 + row  # Mapping: motors 0-3: Index, 4-7: Middle, etc.
+                joint_index = col * 4 + row
                 s = tk.Scale(self.pos_slider_frame, from_=0, to=360, orient=tk.HORIZONTAL,
                              resolution=1, length=250,
                              command=lambda v, idx=joint_index: self.position_slider_changed(idx, v))
@@ -189,6 +181,8 @@ class LeapHandGUI:
         self.stop_rand_button = tk.Button(self.random_frame, text="Stop Random Play", command=self.stop_random_play,
                                           state=tk.DISABLED)
         self.stop_rand_button.pack(side=tk.LEFT, padx=5)
+        self.rand_time_remaining_label = tk.Label(self.random_frame, text="Time Remaining: N/A", font=("Arial", 10))
+        self.rand_time_remaining_label.pack(side=tk.LEFT, padx=5)
 
         # --- Trajectory Controls & Library ---
         traj_ctrl_frame = tk.Frame(self.left_frame)
@@ -330,6 +324,10 @@ class LeapHandGUI:
         self.trajectory_manager.update_replay_camera_callback_from_array = lambda img: update_replay_camera_from_array("Camera", img)
         self.trajectory_manager.update_replay_tactile_callback = lambda finger, path: self.update_playback_image(finger, path)
         self.trajectory_manager.progress_update_callback = lambda progress: self.master.after(0, lambda: self.progress_bar.config(value=progress))
+        # Set the callback to re-enable the random play buttons when random play ends.
+        self.trajectory_manager.random_play_end_callback = self.reset_random_play_buttons
+        # Set the callback to return hand to the safe (initial) pose at the end of random play.
+        self.trajectory_manager.return_to_initial_pose_callback = lambda: self.move_to_pose(safe_pose, override_safety=True)
 
         self.start_rec_button.config(command=self.delayed_start_recording)
         self.stop_rec_button.config(command=self.cancel_recording)
@@ -345,6 +343,10 @@ class LeapHandGUI:
                                                 self.traj_listbox.curselection()[0]
                                                 if self.traj_listbox.curselection() else None))
 
+    def reset_random_play_buttons(self):
+        self.start_rand_button.config(state=tk.NORMAL)
+        self.stop_rand_button.config(state=tk.DISABLED)
+
     def create_contact_status_panel(self):
         """Create a panel in the GUI that shows fingertip (touch) status for each finger."""
         self.contact_status_panel = tk.Frame(self.left_frame, relief=tk.RIDGE, borderwidth=2)
@@ -356,7 +358,6 @@ class LeapHandGUI:
             lbl = tk.Label(self.contact_status_panel, text=f"{finger}: No Contact", fg="green")
             lbl.pack(anchor="w", padx=5, pady=2)
             self.contact_status_labels[finger] = lbl
-        # Mapping fingertip: use distal motor index.
         self.finger_tip_map = {
             "Thumb": 15,
             "Index": 3,
@@ -365,10 +366,9 @@ class LeapHandGUI:
         }
 
     def update_contact_status(self):
-        """Update the fingertip touch status labels based on current readings."""
         try:
             currents = self.leap_node.dxl_client.read_cur()
-            threshold = 30  # Adjust threshold as needed based on calibration.
+            threshold = 30
             for finger, tip_index in self.finger_tip_map.items():
                 if currents is not None:
                     current_value = currents[tip_index]
@@ -379,7 +379,6 @@ class LeapHandGUI:
                     else:
                         text = f"{finger}: {current_value:.2f} (No Contact)"
                         self.contact_status_labels[finger].config(text=text, fg="green")
-                        print(f"{finger} current: {current_value:.2f}")
                 else:
                     self.contact_status_labels[finger].config(text=f"{finger}: Unknown", fg="orange")
                     print(f"{finger} current: Unknown")
@@ -390,10 +389,7 @@ class LeapHandGUI:
     def position_slider_changed(self, idx, value):
         try:
             angle_deg = float(value)
-            # Instead of reading the current positions each time from the hardware,
-            # update the local command vector.
             self.current_command[idx] = np.deg2rad(angle_deg)
-            # Command the entire vector.
             self.leap_node.set_leap(self.current_command)
         except Exception as e:
             print(f"Error in position_slider_changed for joint {idx}: {e}")
@@ -515,6 +511,7 @@ class LeapHandGUI:
         self.start_rand_button.config(state=tk.DISABLED)
         self.stop_rand_button.config(state=tk.NORMAL)
         self.trajectory_manager.record_random_trajectory(duration, fingers)
+        self.update_random_time_remaining()
 
     def stop_random_play(self):
         self.trajectory_manager.stop_recording()
@@ -523,6 +520,20 @@ class LeapHandGUI:
 
     def stop_playback_flag(self):
         self.stop_playback()
+
+    def update_random_time_remaining(self):
+        if self.trajectory_manager.recording:
+            elapsed = time.time() - self.trajectory_manager.record_start_time
+            total = self.trajectory_manager.random_duration_seconds
+            remaining = total - elapsed
+            if remaining < 0:
+                remaining = 0
+            self.rand_time_remaining_label.config(text=f"Time Remaining: {int(remaining)} sec")
+            self.master.after(500, self.update_random_time_remaining)
+        else:
+            self.rand_time_remaining_label.config(text="Random Play Complete")
+            self.start_rand_button.config(state=tk.NORMAL)
+            self.stop_rand_button.config(state=tk.DISABLED)
 
     def on_closing(self):
         flat_pose_rad = lhu.allegro_to_LEAPhand(np.zeros(16))
@@ -541,13 +552,150 @@ class LeapHandGUI:
             print("Error disconnecting sensors:", e)
         self.master.destroy()
 
+    def reset_random_play_buttons(self):
+        self.start_rand_button.config(state=tk.NORMAL)
+        self.stop_rand_button.config(state=tk.DISABLED)
+
+    def position_slider_changed(self, idx, value):
+        try:
+            angle_deg = float(value)
+            self.current_command[idx] = np.deg2rad(angle_deg)
+            self.leap_node.set_leap(self.current_command)
+        except Exception as e:
+            print(f"Error in position_slider_changed for joint {idx}: {e}")
+
+    def effort_limit_changed(self, value):
+        try:
+            new_limit = int(value)
+            self.leap_node.dxl_client.set_current_limit(self.leap_node.motors, new_limit)
+            print(f"Effort (current limit) set to: {new_limit}")
+        except Exception as e:
+            print("Error setting effort limit:", e)
+
+    def threshold_changed(self, value):
+        try:
+            threshold = int(value)
+            self.leap_node.dxl_client.set_effort_threshold(self.leap_node.motors, threshold)
+            print(f"Effort threshold set to: {threshold}")
+        except Exception as e:
+            print("Error setting effort threshold:", e)
+
+    def playback_speed_changed(self, value):
+        try:
+            self.trajectory_manager.playback_speed = float(value)
+            print(f"Playback speed set to: {value}x")
+        except Exception as e:
+            print("Error setting playback speed:", e)
+
+    def update_stream_dimensions(self):
+        width = self.stream_width_var.get()
+        height = self.stream_height_var.get()
+        for stream in self.stream_names:
+            self.live_labels[stream].config(width=width, height=height)
+            self.playback_labels[stream].config(width=width, height=height)
+        print(f"[INFO] Stream dimensions updated: {width}x{height}")
+
+    def update_slider_positions(self):
+        try:
+            current_pose_deg = np.rad2deg(self.leap_node.read_pos())
+            for i, slider in enumerate(self.sliders):
+                slider.set(current_pose_deg[i])
+        except Exception as e:
+            print(f"Slider update failed: {e}")
+        self.master.after(500, self.update_slider_positions)
+
+    def read_positions(self):
+        try:
+            return self.leap_node.read_pos()
+        except Exception as e:
+            print("Error reading positions:", e)
+            return None
+
+    def update_current_positions(self):
+        self.read_positions()
+        self.master.after(1000, self.update_current_positions)
+
+    def move_to_pose(self, target_pose, steps=None, delay=None, override_safety=False):
+        current_pose = self.leap_node.curr_pos.copy()
+        if steps is None:
+            steps = GLOBAL_SMOOTHING_STEPS
+        if delay is None:
+            delay = GLOBAL_SMOOTHING_DELAY
+        self.leap_node.pause_control_loop()
+        for i in range(1, steps + 1):
+            t = i / steps
+            s = 3 * (t ** 2) - 2 * (t ** 3)
+            interp_pose = current_pose + (target_pose - current_pose) * s
+            self.leap_node.set_leap(interp_pose, override_safety=override_safety)
+            time.sleep(delay / 1000.0)
+        self.leap_node.resume_control_loop()
+
+    def toggle_pause(self):
+        if self.trajectory_manager:
+            self.trajectory_manager.toggle_pause()
+        else:
+            print("Trajectory manager not initialized.")
+
+    def stop_playback(self):
+        if self.trajectory_manager:
+            self.trajectory_manager.stop_playback()
+            print("Stop playback requested.")
+        else:
+            print("Trajectory manager not initialized.")
+
+    def delayed_start_recording(self):
+        print("Start Recording requested. Recording will begin in 3 seconds...")
+        self.start_rec_button.config(state=tk.DISABLED)
+        self.start_delay_job = self.master.after(3000, self.execute_start_recording)
+
+    def execute_start_recording(self):
+        self.start_delay_job = None
+        self.trajectory_manager.start_recording()
+
+    def cancel_recording(self):
+        if self.start_delay_job is not None:
+            self.master.after_cancel(self.start_delay_job)
+            self.start_delay_job = None
+            print("Delayed start canceled.")
+            self.start_rec_button.config(state=tk.NORMAL)
+        else:
+            self.trajectory_manager.stop_recording()
+
+    def start_random_play(self):
+        if self.start_delay_job is not None:
+            self.master.after_cancel(self.start_delay_job)
+            self.start_delay_job = None
+        fingers = []
+        if self.rand_thumb_var.get():
+            fingers.append("Thumb")
+        if self.rand_index_var.get():
+            fingers.append("Index")
+        if self.rand_middle_var.get():
+            fingers.append("Middle")
+        if self.rand_ring_var.get():
+            fingers.append("Ring")
+        duration = self.rand_duration_var.get()
+        if not fingers:
+            print("No fingers selected for random play.")
+            return
+        self.start_rand_button.config(state=tk.DISABLED)
+        self.stop_rand_button.config(state=tk.NORMAL)
+        self.trajectory_manager.record_random_trajectory(duration, fingers)
+        self.update_random_time_remaining()
+
+    def stop_random_play(self):
+        self.trajectory_manager.stop_recording()
+        self.start_rand_button.config(state=tk.NORMAL)
+        self.stop_rand_button.config(state=tk.DISABLED)
+
+    def stop_playback_flag(self):
+        self.stop_playback()
 
 def main():
     root = tk.Tk()
     gui = LeapHandGUI(root)
     root.protocol("WM_DELETE_WINDOW", gui.on_closing)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
