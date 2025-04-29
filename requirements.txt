@@ -5,3 +5,4 @@ pillow==11.1.0
 pyudev==0.24.3
 setuptools==65.5.1
 nox==2025.2.9
+dynamixel_sdk

@@ -1,3 +1,5 @@
+# leap_hand_gui_new.py
+
 import threading
 import tkinter as tk
 import tkinter.ttk as ttk
@@ -12,9 +14,13 @@ from leap_node import LeapNode
 import leap_hand_utils as lhu
 from PIL import Image, ImageTk
 
+# Import the MediaPipe integration module.
+from mediapipe_integration import MediapipeStream
+
 # Global smoothing parameters.
 GLOBAL_SMOOTHING_STEPS = 30
 GLOBAL_SMOOTHING_DELAY = 20
+
 
 class LeapHandGUI:
     def __init__(self, master):
@@ -23,6 +29,36 @@ class LeapHandGUI:
 
         # For delayed start of normal recording.
         self.start_delay_job = None
+
+        # Calibration mapping: human 0°→robot 180°, human max→robot 270° (or corresponding end)
+        self.calibration = {
+            'Index': {
+                'mcp': {'servo_open': 160.0, 'servo_closed': 260.0, 'h_open': 90.0, 'h_closed': 50.0},
+                'pip': {'servo_open': 180.0, 'servo_closed': 280.0, 'h_open': 175.0, 'h_closed': 70.0},
+                'dip': {'servo_open': 180.0, 'servo_closed': 260.0, 'h_open': 175.0, 'h_closed': 120.0},
+                'abd': {'servo_open': 150.0, 'servo_closed': 190.0, 'h_open': 110.0, 'h_closed': 80.0},
+            },
+            'Middle': {
+                'mcp': {'servo_open': 160.0, 'servo_closed': 200.0, 'h_open': 20.0, 'h_closed': 25.0},
+                'pip': {'servo_open': 180.0, 'servo_closed': 260.0, 'h_open': 175.0, 'h_closed': 70.0},
+                'dip': {'servo_open': 180.0, 'servo_closed': 260.0, 'h_open': 175.0, 'h_closed': 120.0},
+                'abd': {'servo_open': 195.0, 'servo_closed': 170.0, 'h_open': 100.0, 'h_closed': 120.0},
+            },
+            'Ring': {
+                'mcp': {'servo_open': 160.0, 'servo_closed': 200.0, 'h_open': 15.0, 'h_closed': 44.0},
+                'pip': {'servo_open': 160.0, 'servo_closed': 240.0, 'h_open': 175.0, 'h_closed': 40.0},
+                'dip': {'servo_open': 180.0, 'servo_closed': 240.0, 'h_open': 175.0, 'h_closed': 156.0},
+                'abd': {'servo_open': 170.0, 'servo_closed': 190.0, 'h_open': 72.0, 'h_closed': 85.0},
+            },
+            'Thumb': {
+                'mcp': {'servo_open': 180.0, 'servo_closed': 260.0, 'h_open': 150.0, 'h_closed': 147.0},
+                'pip': {'servo_open': 180.0, 'servo_closed': 260.0, 'h_open': 173.0, 'h_closed': 110.0},
+                'dip': {'servo_open': 180.0, 'servo_closed': 250.0, 'h_open': 173.0, 'h_closed': 120.0},
+                'abd': {'servo_open': 150.0, 'servo_closed': 190.0, 'h_open': 10.0, 'h_closed': 0.0},
+            },
+        }
+        self.previous_angles = {}  # Store previous angles for each finger
+        self.angle_update_threshold = 2  # degrees
 
         # --- Random Play Option Variables ---
         self.rand_thumb_var = tk.BooleanVar(value=False)
@@ -46,6 +82,16 @@ class LeapHandGUI:
         self.right_frame = tk.Frame(master)
         self.right_frame.pack(side=tk.RIGHT, padx=10, pady=10, fill=tk.BOTH, expand=True)
 
+        # --- Mediapipe Teleop Stream Toggle ---
+        self.mediapipe_enabled = tk.BooleanVar(value=False)
+        self.mediapipe_checkbox = tk.Checkbutton(
+            self.left_frame,
+            text="Enable Mediapipe Teleop Stream",
+            variable=self.mediapipe_enabled,
+            command=self.toggle_mediapipe_stream
+        )
+        self.mediapipe_checkbox.pack(padx=5, pady=5, fill=tk.X)
+
         # Create LeapNode instance.
         self.leap_node = LeapNode()
         self.leap_node.initialize_current_pose_from_motors()
@@ -55,8 +101,8 @@ class LeapHandGUI:
         flat_pose_deg = np.rad2deg(flat_pose_rad)
         for idx in [1, 5, 9]:
             flat_pose_deg[idx] = 94
-        default_pose = np.deg2rad(flat_pose_deg)
-        safe_pose = lhu.angle_safety_clip(default_pose)
+        self.default_pose = np.deg2rad(flat_pose_deg)
+        safe_pose = lhu.angle_safety_clip(self.default_pose)
         # Compute safe_pose in degrees for use in the sliders.
         safe_pose_deg = np.rad2deg(safe_pose)
 
@@ -65,12 +111,13 @@ class LeapHandGUI:
 
         self.leap_node.pause_control_loop()
         self.move_to_pose(safe_pose, override_safety=True)
+        print("[GUI] Initialized LeapNode with default pose:", self.default_pose)
         self.leap_node.resume_control_loop()
 
         # Create the contact detection panel.
         self.create_contact_status_panel()
         self.update_contact_status()
-
+        self.mp_gain = 0.4
         # -------------------------
         # LEFT SIDE – Controls and Configuration
         # -------------------------
@@ -82,23 +129,23 @@ class LeapHandGUI:
             row=0, column=0, columnspan=5, pady=5)
 
         finger_names = ["Index", "Middle", "Ring", "Thumb"]
-        joint_names  = ["MCP Side", "MCP Forward", "PIP", "DIP"]
-        self.sliders = [None] * 16
+        joint_names = ["MCP Side", "MCP Forward", "PIP", "DIP"]
+        self.sliders = [None] * 16  # Flat list for 16 sliders.
 
         for col, finger in enumerate(finger_names):
             header = tk.Label(self.pos_slider_frame, text=finger, font=("Arial", 10, "bold"))
-            header.grid(row=1, column=col+1, padx=5, pady=5)
+            header.grid(row=1, column=col + 1, padx=5, pady=5)
 
         for row, joint in enumerate(joint_names):
             joint_label = tk.Label(self.pos_slider_frame, text=joint, width=12)
-            joint_label.grid(row=row+2, column=0, padx=5, pady=5)
+            joint_label.grid(row=row + 2, column=0, padx=5, pady=5)
             for col, finger in enumerate(finger_names):
                 joint_index = col * 4 + row
                 s = tk.Scale(self.pos_slider_frame, from_=0, to=360, orient=tk.HORIZONTAL,
                              resolution=1, length=250,
                              command=lambda v, idx=joint_index: self.position_slider_changed(idx, v))
                 s.set(safe_pose_deg[joint_index])
-                s.grid(row=row+2, column=col+1, padx=5, pady=5)
+                s.grid(row=row + 2, column=col + 1, padx=5, pady=5)
                 self.sliders[joint_index] = s
 
         # --- Finger Teach Manager ---
@@ -204,10 +251,11 @@ class LeapHandGUI:
         traj_btn_frame = tk.Frame(traj_lib_frame)
         traj_btn_frame.pack(side=tk.LEFT, padx=5, pady=5)
         self.play_traj_button = tk.Button(traj_btn_frame, text="Play Selected Trajectory",
-                                          command=lambda: threading.Thread(target=self.trajectory_manager.play_trajectory,
-                                                args=(self.traj_listbox.curselection()[0]
-                                                      if self.traj_listbox.curselection() else None,),
-                                                daemon=True).start())
+                                          command=lambda: threading.Thread(
+                                              target=self.trajectory_manager.play_trajectory,
+                                              args=(self.traj_listbox.curselection()[0]
+                                                    if self.traj_listbox.curselection() else None,),
+                                              daemon=True).start())
         self.play_traj_button.pack(pady=2)
         self.pause_traj_button = tk.Button(traj_btn_frame, text="Pause", state=tk.DISABLED,
                                            command=self.toggle_pause)
@@ -278,6 +326,10 @@ class LeapHandGUI:
         self.update_live_image = update_live_image
         self.update_playback_image = update_playback_image
 
+        self.safe_pose = safe_pose.copy()  # preserve this as your “rest” pose
+        self.current_command = safe_pose.copy()
+        self.mp_alpha = 0.3  # smoothing factor (0 < α < 1)
+
         def update_replay_camera_from_array(stream, img):
             try:
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -303,10 +355,12 @@ class LeapHandGUI:
         self.size_frame.pack(side=tk.TOP, padx=5, pady=5)
         tk.Label(self.size_frame, text="Stream Width:").pack(side=tk.LEFT)
         tk.Spinbox(self.size_frame, from_=160, to=1280, increment=16,
-                   textvariable=self.stream_width_var, width=5, command=self.update_stream_dimensions).pack(side=tk.LEFT, padx=5)
+                   textvariable=self.stream_width_var, width=5, command=self.update_stream_dimensions).pack(
+            side=tk.LEFT, padx=5)
         tk.Label(self.size_frame, text="Stream Height:").pack(side=tk.LEFT)
         tk.Spinbox(self.size_frame, from_=120, to=720, increment=16,
-                   textvariable=self.stream_height_var, width=5, command=self.update_stream_dimensions).pack(side=tk.LEFT, padx=5)
+                   textvariable=self.stream_height_var, width=5, command=self.update_stream_dimensions).pack(
+            side=tk.LEFT, padx=5)
 
         self.update_current_positions()
 
@@ -320,35 +374,153 @@ class LeapHandGUI:
         self.trajectory_manager.replay_panel_show_callback = lambda: None
         self.trajectory_manager.pause_traj_button_callback = lambda state, text: self.pause_traj_button.config(
             state=tk.NORMAL if state == "normal" else tk.DISABLED, text=text)
-        self.trajectory_manager.update_replay_camera_callback = lambda cam_path: self.update_playback_image("Camera", cam_path)
-        self.trajectory_manager.update_replay_camera_callback_from_array = lambda img: update_replay_camera_from_array("Camera", img)
-        self.trajectory_manager.update_replay_tactile_callback = lambda finger, path: self.update_playback_image(finger, path)
-        self.trajectory_manager.progress_update_callback = lambda progress: self.master.after(0, lambda: self.progress_bar.config(value=progress))
-        # Set the callback to re-enable the random play buttons when random play ends.
+        self.trajectory_manager.update_replay_camera_callback = lambda cam_path: self.update_playback_image("Camera",
+                                                                                                            cam_path)
+        self.trajectory_manager.update_replay_camera_callback_from_array = lambda img: update_replay_camera_from_array(
+            "Camera", img)
+        self.trajectory_manager.update_replay_tactile_callback = lambda finger, path: self.update_playback_image(finger,
+                                                                                                                 path)
+        self.trajectory_manager.progress_update_callback = lambda progress: self.master.after(0,
+                                                                                              lambda: self.progress_bar.config(
+                                                                                                  value=progress))
         self.trajectory_manager.random_play_end_callback = self.reset_random_play_buttons
-        # Set the callback to return hand to the safe (initial) pose at the end of random play.
-        self.trajectory_manager.return_to_initial_pose_callback = lambda: self.move_to_pose(safe_pose, override_safety=True)
+        self.trajectory_manager.return_to_initial_pose_callback = lambda: self.move_to_pose(safe_pose,
+                                                                                            override_safety=True)
 
         self.start_rec_button.config(command=self.delayed_start_recording)
         self.stop_rec_button.config(command=self.cancel_recording)
         self.start_rand_button.config(command=self.start_random_play)
         self.stop_rand_button.config(command=self.stop_random_play)
         self.play_traj_button.config(command=lambda: threading.Thread(target=self.trajectory_manager.play_trajectory,
-                                                args=(self.traj_listbox.curselection()[0]
-                                                      if self.traj_listbox.curselection() else None,),
-                                                daemon=True).start())
+                                                                      args=(self.traj_listbox.curselection()[0]
+                                                                            if self.traj_listbox.curselection() else None,),
+                                                                      daemon=True).start())
         self.pause_traj_button.config(command=self.toggle_pause)
         self.stop_playback_button.config(command=self.stop_playback)
         self.delete_traj_button.config(command=lambda: self.trajectory_manager.delete_trajectory(
-                                                self.traj_listbox.curselection()[0]
-                                                if self.traj_listbox.curselection() else None))
+            self.traj_listbox.curselection()[0]
+            if self.traj_listbox.curselection() else None))
+
+    def toggle_mediapipe_stream(self):
+        if self.mediapipe_enabled.get():
+            self.start_mediapipe_stream()
+        else:
+            self.stop_mediapipe_stream()
+
+    def start_mediapipe_stream(self):
+        # Create a frame to display the mediapipe stream.
+        self.mediapipe_frame = tk.Frame(self.right_frame, borderwidth=2, relief=tk.GROOVE)
+        # Pack without fill=tk.X so it can expand vertically to fit the image.
+        self.mediapipe_frame.pack(side=tk.BOTTOM, padx=5, pady=5)
+
+        # Title label
+        tk.Label(
+            self.mediapipe_frame,
+            text="Mediapipe Teleop Stream",
+            font=("Arial", 12, "bold")
+        ).pack(side=tk.TOP, pady=2)
+
+        # Stream label — no fixed width/height so it sizes to the PhotoImage
+        self.mediapipe_label = tk.Label(self.mediapipe_frame, bg="black")
+        self.mediapipe_label.pack(side=tk.TOP, pady=5)
+
+        # Instantiate and start the MediaPipe stream thread
+        self.mediapipe_stream = MediapipeStream()
+        self.mediapipe_thread = threading.Thread(
+            target=self.mediapipe_stream_loop,
+            daemon=True
+        )
+        self.mediapipe_thread.start()
+
+    def stop_mediapipe_stream(self):
+        if hasattr(self, 'mediapipe_stream'):
+            self.mediapipe_stream.stop()
+        if hasattr(self, 'mediapipe_thread') and self.mediapipe_thread.is_alive():
+            self.mediapipe_thread.join(timeout=1)
+        if hasattr(self, 'mediapipe_frame') and self.mediapipe_frame:
+            self.mediapipe_frame.destroy()
+            self.mediapipe_frame = None
+
+    def mediapipe_stream_loop(self):
+        """
+        Runs in its own thread:
+          - receives (image, angles) from Mediapipe
+          - updates the GUI image
+          - applies angles to robot if enabled
+        """
+        from PIL import Image, ImageTk
+
+        def callback(img, angles):
+            # display
+            photo = ImageTk.PhotoImage(Image.fromarray(img))
+            self.mediapipe_label.after(0, lambda p=photo: self.update_mediapipe_image(p))
+
+            # print("[GUI] callback got angles:", angles)
+            if self.mediapipe_enabled.get():
+                # print("[GUI] applying angles to robot")
+                print("[GUI] Human hand angles:", angles)
+                # convert to robot angles to degrees
+                default_pose_deg = np.round(np.rad2deg(self.default_pose))
+                print("[GUI] Robot hand angles:", default_pose_deg)
+                self.master.after(0, lambda a=angles: self.apply_mediapipe_angles(a))
+
+        w, h = self.stream_width_var.get(), self.stream_height_var.get()
+        self.mediapipe_stream.stream_loop(callback, w, h)
+
+    def apply_mediapipe_angles(self, angles):
+        """
+        Smoothly apply angles using a low-pass filter to avoid jerkiness.
+        """
+        cmd = np.copy(self.default_pose)
+        smoothing_alpha = 0.1   # 0.1–0.3 is typical
+
+        for finger in ['Index', 'Middle', 'Ring']:
+            for joint_name, pos in [('abduction', 0), ('mcp', 1), ('pip', 2), ('dip', 3)]:
+                h = float(angles[finger].get(joint_name, 0.0))
+
+                prev_h = self.previous_angles.get((finger, joint_name), None)
+
+                if prev_h is None:
+                    # First time: just take the detected angle
+                    smoothed_h = h
+                else:
+                    # Smooth update
+                    smoothed_h = (1 - smoothing_alpha) * prev_h + smoothing_alpha * h
+
+                # Save smoothed angle
+                self.previous_angles[(finger, joint_name)] = smoothed_h
+
+                key = 'abd' if joint_name == 'abduction' else joint_name
+                cal = self.calibration[finger][key]
+
+                h_open, h_closed = cal['h_open'], cal['h_closed']
+                s_open, s_closed = cal['servo_open'], cal['servo_closed']
+
+                ratio = (smoothed_h - h_open) / (h_closed - h_open)
+                servo_deg = s_open + ratio * (s_closed - s_open)
+
+                # Clamp
+                lo, hi = min(s_open, s_closed), max(s_open, s_closed)
+                servo_deg = max(lo, min(hi, servo_deg))
+
+                joint_idx = self.fingers[finger][pos]
+                cmd[joint_idx] = np.deg2rad(servo_deg)
+
+                print(
+                    f"[Smoothed] {finger} {joint_name.upper():>9}: smoothed={smoothed_h:.1f}°, servo={servo_deg:.1f}°, idx={joint_idx}")
+
+        self.leap_node.set_leap(lhu.angle_safety_clip(cmd))
+
+    def update_mediapipe_image(self, photo):
+        self.mediapipe_label.config(image=photo)
+        self.mediapipe_label.image = photo
 
     def reset_random_play_buttons(self):
         self.start_rand_button.config(state=tk.NORMAL)
         self.stop_rand_button.config(state=tk.DISABLED)
+        self.rand_time_remaining_label.config(text="Time Remaining: N/A")
 
     def create_contact_status_panel(self):
-        """Create a panel in the GUI that shows fingertip (touch) status for each finger."""
         self.contact_status_panel = tk.Frame(self.left_frame, relief=tk.RIDGE, borderwidth=2)
         self.contact_status_panel.pack(padx=5, pady=5, fill=tk.X)
         tk.Label(self.contact_status_panel, text="Fingertip Touch Status", font=("Arial", 10, "bold")).pack(
@@ -368,14 +540,14 @@ class LeapHandGUI:
     def update_contact_status(self):
         try:
             currents = self.leap_node.dxl_client.read_cur()
-            threshold = 30
+            threshold = 34
             for finger, tip_index in self.finger_tip_map.items():
                 if currents is not None:
                     current_value = currents[tip_index]
                     if current_value > threshold:
                         text = f"{finger}: {current_value:.2f} (Contact)"
                         self.contact_status_labels[finger].config(text=text, fg="red")
-                        print(f"Contact detected on {finger}: {current_value:.2f} (above threshold {threshold})")
+                        print(f"Contact detected on {finger}: {current_value:.2f} (above {threshold})")
                     else:
                         text = f"{finger}: {current_value:.2f} (No Contact)"
                         self.contact_status_labels[finger].config(text=text, fg="green")
@@ -524,7 +696,8 @@ class LeapHandGUI:
     def update_random_time_remaining(self):
         if self.trajectory_manager.recording:
             elapsed = time.time() - self.trajectory_manager.record_start_time
-            total = self.trajectory_manager.random_duration_seconds
+            total = self.trajectory_manager.random_duration_seconds if hasattr(self.trajectory_manager,
+                                                                               "random_duration_seconds") else 0
             remaining = total - elapsed
             if remaining < 0:
                 remaining = 0
@@ -552,150 +725,13 @@ class LeapHandGUI:
             print("Error disconnecting sensors:", e)
         self.master.destroy()
 
-    def reset_random_play_buttons(self):
-        self.start_rand_button.config(state=tk.NORMAL)
-        self.stop_rand_button.config(state=tk.DISABLED)
-
-    def position_slider_changed(self, idx, value):
-        try:
-            angle_deg = float(value)
-            self.current_command[idx] = np.deg2rad(angle_deg)
-            self.leap_node.set_leap(self.current_command)
-        except Exception as e:
-            print(f"Error in position_slider_changed for joint {idx}: {e}")
-
-    def effort_limit_changed(self, value):
-        try:
-            new_limit = int(value)
-            self.leap_node.dxl_client.set_current_limit(self.leap_node.motors, new_limit)
-            print(f"Effort (current limit) set to: {new_limit}")
-        except Exception as e:
-            print("Error setting effort limit:", e)
-
-    def threshold_changed(self, value):
-        try:
-            threshold = int(value)
-            self.leap_node.dxl_client.set_effort_threshold(self.leap_node.motors, threshold)
-            print(f"Effort threshold set to: {threshold}")
-        except Exception as e:
-            print("Error setting effort threshold:", e)
-
-    def playback_speed_changed(self, value):
-        try:
-            self.trajectory_manager.playback_speed = float(value)
-            print(f"Playback speed set to: {value}x")
-        except Exception as e:
-            print("Error setting playback speed:", e)
-
-    def update_stream_dimensions(self):
-        width = self.stream_width_var.get()
-        height = self.stream_height_var.get()
-        for stream in self.stream_names:
-            self.live_labels[stream].config(width=width, height=height)
-            self.playback_labels[stream].config(width=width, height=height)
-        print(f"[INFO] Stream dimensions updated: {width}x{height}")
-
-    def update_slider_positions(self):
-        try:
-            current_pose_deg = np.rad2deg(self.leap_node.read_pos())
-            for i, slider in enumerate(self.sliders):
-                slider.set(current_pose_deg[i])
-        except Exception as e:
-            print(f"Slider update failed: {e}")
-        self.master.after(500, self.update_slider_positions)
-
-    def read_positions(self):
-        try:
-            return self.leap_node.read_pos()
-        except Exception as e:
-            print("Error reading positions:", e)
-            return None
-
-    def update_current_positions(self):
-        self.read_positions()
-        self.master.after(1000, self.update_current_positions)
-
-    def move_to_pose(self, target_pose, steps=None, delay=None, override_safety=False):
-        current_pose = self.leap_node.curr_pos.copy()
-        if steps is None:
-            steps = GLOBAL_SMOOTHING_STEPS
-        if delay is None:
-            delay = GLOBAL_SMOOTHING_DELAY
-        self.leap_node.pause_control_loop()
-        for i in range(1, steps + 1):
-            t = i / steps
-            s = 3 * (t ** 2) - 2 * (t ** 3)
-            interp_pose = current_pose + (target_pose - current_pose) * s
-            self.leap_node.set_leap(interp_pose, override_safety=override_safety)
-            time.sleep(delay / 1000.0)
-        self.leap_node.resume_control_loop()
-
-    def toggle_pause(self):
-        if self.trajectory_manager:
-            self.trajectory_manager.toggle_pause()
-        else:
-            print("Trajectory manager not initialized.")
-
-    def stop_playback(self):
-        if self.trajectory_manager:
-            self.trajectory_manager.stop_playback()
-            print("Stop playback requested.")
-        else:
-            print("Trajectory manager not initialized.")
-
-    def delayed_start_recording(self):
-        print("Start Recording requested. Recording will begin in 3 seconds...")
-        self.start_rec_button.config(state=tk.DISABLED)
-        self.start_delay_job = self.master.after(3000, self.execute_start_recording)
-
-    def execute_start_recording(self):
-        self.start_delay_job = None
-        self.trajectory_manager.start_recording()
-
-    def cancel_recording(self):
-        if self.start_delay_job is not None:
-            self.master.after_cancel(self.start_delay_job)
-            self.start_delay_job = None
-            print("Delayed start canceled.")
-            self.start_rec_button.config(state=tk.NORMAL)
-        else:
-            self.trajectory_manager.stop_recording()
-
-    def start_random_play(self):
-        if self.start_delay_job is not None:
-            self.master.after_cancel(self.start_delay_job)
-            self.start_delay_job = None
-        fingers = []
-        if self.rand_thumb_var.get():
-            fingers.append("Thumb")
-        if self.rand_index_var.get():
-            fingers.append("Index")
-        if self.rand_middle_var.get():
-            fingers.append("Middle")
-        if self.rand_ring_var.get():
-            fingers.append("Ring")
-        duration = self.rand_duration_var.get()
-        if not fingers:
-            print("No fingers selected for random play.")
-            return
-        self.start_rand_button.config(state=tk.DISABLED)
-        self.stop_rand_button.config(state=tk.NORMAL)
-        self.trajectory_manager.record_random_trajectory(duration, fingers)
-        self.update_random_time_remaining()
-
-    def stop_random_play(self):
-        self.trajectory_manager.stop_recording()
-        self.start_rand_button.config(state=tk.NORMAL)
-        self.stop_rand_button.config(state=tk.DISABLED)
-
-    def stop_playback_flag(self):
-        self.stop_playback()
 
 def main():
     root = tk.Tk()
     gui = LeapHandGUI(root)
     root.protocol("WM_DELETE_WINDOW", gui.on_closing)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
