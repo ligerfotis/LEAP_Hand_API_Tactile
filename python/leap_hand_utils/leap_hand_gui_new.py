@@ -51,12 +51,21 @@ class LeapHandGUI:
                 'abd': {'servo_open': 170.0, 'servo_closed': 190.0, 'h_open': 72.0, 'h_closed': 85.0},
             },
             'Thumb': {
-                'mcp': {'servo_open': 180.0, 'servo_closed': 260.0, 'h_open': 150.0, 'h_closed': 147.0},
-                'pip': {'servo_open': 180.0, 'servo_closed': 260.0, 'h_open': 173.0, 'h_closed': 110.0},
+                'mcp': {'servo_open': 180.0, 'servo_closed': 260.0, 'h_open': 150.0, 'h_closed': 100.0},
+                'pip': {'servo_open': 180.0, 'servo_closed': 260.0, 'h_open': 163.0, 'h_closed': 130.0},
                 'dip': {'servo_open': 180.0, 'servo_closed': 250.0, 'h_open': 173.0, 'h_closed': 120.0},
-                'abd': {'servo_open': 150.0, 'servo_closed': 190.0, 'h_open': 10.0, 'h_closed': 0.0},
+                'abd': {'servo_open': 180.0, 'servo_closed': 260.0, 'h_open': 85.0, 'h_closed': 10.0},
+                'twist': {
+                    # when the human thumb is fully “opposed” (rotated in toward palm at ~+30°),
+                    # send the servo to its “closed” twist limit:
+                    'h_open': 20.0,  # human twist angle at which servo should be at its “open” limit
+                    'h_closed': 60.0,  # human twist angle at which servo should be at its “closed” limit
+                    'servo_open': 150.0,  # choose based on your hardware’s neutral/open twist position
+                    'servo_closed': 180.0,  # choose based on your hardware’s max twist position
+                },
             },
         }
+
         self.previous_angles = {}  # Store previous angles for each finger
         self.angle_update_threshold = 2  # degrees
 
@@ -403,9 +412,31 @@ class LeapHandGUI:
 
     def toggle_mediapipe_stream(self):
         if self.mediapipe_enabled.get():
+            self.show_teleop_checkboxes()
             self.start_mediapipe_stream()
         else:
+            self.hide_teleop_checkboxes()
             self.stop_mediapipe_stream()
+
+    def hide_teleop_checkboxes(self):
+        # Destroy the panel and vars when teleop is turned off
+        if hasattr(self, 'teleop_select_frame'):
+            self.teleop_select_frame.destroy()
+            del self.teleop_select_frame
+        if hasattr(self, 'teleop_vars'):
+            del self.teleop_vars
+
+    def show_teleop_checkboxes(self):
+        # Create a panel of checkboxes for each finger
+        self.teleop_select_frame = tk.Frame(self.left_frame, relief=tk.RIDGE, borderwidth=2)
+        self.teleop_select_frame.pack(padx=5, pady=5, fill=tk.X)
+        tk.Label(self.teleop_select_frame, text="Teleop Fingers:", font=("Arial", 10, "bold")).pack(anchor="w", padx=5)
+        self.teleop_vars = {}
+        for finger in ["Thumb", "Index", "Middle", "Ring"]:
+            var = tk.BooleanVar(value=False)
+            chk = tk.Checkbutton(self.teleop_select_frame, text=finger, variable=var)
+            chk.pack(side=tk.LEFT, padx=5)
+            self.teleop_vars[finger] = var
 
     def start_mediapipe_stream(self):
         # Create a frame to display the mediapipe stream.
@@ -455,11 +486,9 @@ class LeapHandGUI:
             photo = ImageTk.PhotoImage(Image.fromarray(img))
             self.mediapipe_label.after(0, lambda p=photo: self.update_mediapipe_image(p))
 
-            # print("[GUI] callback got angles:", angles)
-            if self.mediapipe_enabled.get():
-                # print("[GUI] applying angles to robot")
+            # only apply if teleop is on and we actually detected a hand
+            if self.mediapipe_enabled.get() and angles:
                 print("[GUI] Human hand angles:", angles)
-                # convert to robot angles to degrees
                 default_pose_deg = np.round(np.rad2deg(self.default_pose))
                 print("[GUI] Robot hand angles:", default_pose_deg)
                 self.master.after(0, lambda a=angles: self.apply_mediapipe_angles(a))
@@ -469,47 +498,104 @@ class LeapHandGUI:
 
     def apply_mediapipe_angles(self, angles):
         """
-        Smoothly apply angles using a low-pass filter to avoid jerkiness.
+        Per-finger tele-operation gated by check-boxes.
+
+        Only fingers whose BooleanVar is checked ( .get() == True )
+        are updated from Mediapipe; all others stay exactly where
+        they were (self.current_command).
+
+        If no hand, or no check-boxes ticked, we do nothing.
         """
-        cmd = np.copy(self.default_pose)
-        smoothing_alpha = 0.1   # 0.1–0.3 is typical
+        # ── Guard clauses ────────────────────────────────────────
+        if not angles or not hasattr(self, "teleop_vars"):
+            return
+        if not any(var.get() for var in self.teleop_vars.values()):
+            return
 
-        for finger in ['Index', 'Middle', 'Ring']:
-            for joint_name, pos in [('abduction', 0), ('mcp', 1), ('pip', 2), ('dip', 3)]:
+        # start from the pose we last sent to the robot
+        cmd = np.copy(self.current_command)
+        α = 0.1  # smoothing factor
+
+        # ------------ Index / Middle / Ring ---------------------
+        for finger in ["Index", "Middle", "Ring"]:
+            # skip if the checkbox is not ticked
+            if finger not in self.teleop_vars or not self.teleop_vars[finger].get():
+                continue
+            if finger not in angles:
+                continue
+
+            for joint_name, pos in [("abduction", 0), ("mcp", 1),
+                                    ("pip", 2), ("dip", 3)]:
                 h = float(angles[finger].get(joint_name, 0.0))
+                prev = self.previous_angles.get((finger, joint_name))
+                sm = h if prev is None else (1 - α) * prev + α * h
+                self.previous_angles[(finger, joint_name)] = sm
 
-                prev_h = self.previous_angles.get((finger, joint_name), None)
-
-                if prev_h is None:
-                    # First time: just take the detected angle
-                    smoothed_h = h
-                else:
-                    # Smooth update
-                    smoothed_h = (1 - smoothing_alpha) * prev_h + smoothing_alpha * h
-
-                # Save smoothed angle
-                self.previous_angles[(finger, joint_name)] = smoothed_h
-
-                key = 'abd' if joint_name == 'abduction' else joint_name
+                key = "abd" if joint_name == "abduction" else joint_name
                 cal = self.calibration[finger][key]
+                ratio = (sm - cal["h_open"]) / (cal["h_closed"] - cal["h_open"])
+                sd = cal["servo_open"] + ratio * (cal["servo_closed"] - cal["servo_open"])
+                sd = max(min(sd, max(cal["servo_open"], cal["servo_closed"])),
+                         min(cal["servo_open"], cal["servo_closed"]))
 
-                h_open, h_closed = cal['h_open'], cal['h_closed']
-                s_open, s_closed = cal['servo_open'], cal['servo_closed']
+                idx = self.fingers[finger][pos]
+                cmd[idx] = np.deg2rad(sd)
 
-                ratio = (smoothed_h - h_open) / (h_closed - h_open)
-                servo_deg = s_open + ratio * (s_closed - s_open)
+        # --------------------- Thumb -----------------------------
+        if self.teleop_vars.get("Thumb", tk.BooleanVar(value=False)).get() and "Thumb" in angles:
+            tidx = self.fingers["Thumb"]  # [motor0,1,2,3]
 
-                # Clamp
-                lo, hi = min(s_open, s_closed), max(s_open, s_closed)
-                servo_deg = max(lo, min(hi, servo_deg))
+            # Abduction  → motor 0
+            raw = float(angles["Thumb"].get("abduction", 0.0))
+            prev = self.previous_angles.get(("Thumb", "abduction"))
+            sm = raw if prev is None else (1 - α) * prev + α * raw
+            self.previous_angles[("Thumb", "abduction")] = sm
+            cal = self.calibration["Thumb"]["abd"]
+            ratio = (sm - cal["h_open"]) / (cal["h_closed"] - cal["h_open"])
+            sd = cal["servo_open"] + ratio * (cal["servo_closed"] - cal["servo_open"])
+            sd = max(min(sd, max(cal["servo_open"], cal["servo_closed"])),
+                     min(cal["servo_open"], cal["servo_closed"]))
+            cmd[tidx[0]] = np.deg2rad(sd)
 
-                joint_idx = self.fingers[finger][pos]
-                cmd[joint_idx] = np.deg2rad(servo_deg)
+            # Twist       → motor 1
+            raw = float(angles["Thumb"].get("twist", 0.0))
+            prev = self.previous_angles.get(("Thumb", "twist"))
+            sm = raw if prev is None else (1 - α) * prev + α * raw
+            self.previous_angles[("Thumb", "twist")] = sm
+            cal = self.calibration["Thumb"]["twist"]
+            ratio = (sm - cal["h_open"]) / (cal["h_closed"] - cal["h_open"])
+            sd = cal["servo_open"] + ratio * (cal["servo_closed"] - cal["servo_open"])
+            sd = max(min(sd, max(cal["servo_open"], cal["servo_closed"])),
+                     min(cal["servo_open"], cal["servo_closed"]))
+            cmd[tidx[1]] = np.deg2rad(sd)
 
-                print(
-                    f"[Smoothed] {finger} {joint_name.upper():>9}: smoothed={smoothed_h:.1f}°, servo={servo_deg:.1f}°, idx={joint_idx}")
+            # MCP flexion → motor 2
+            raw = float(angles["Thumb"].get("mcp", 0.0))
+            prev = self.previous_angles.get(("Thumb", "mcp"))
+            sm = raw if prev is None else (1 - α) * prev + α * raw
+            self.previous_angles[("Thumb", "mcp")] = sm
+            cal = self.calibration["Thumb"]["mcp"]
+            ratio = (sm - cal["h_open"]) / (cal["h_closed"] - cal["h_open"])
+            sd = cal["servo_open"] + ratio * (cal["servo_closed"] - cal["servo_open"])
+            sd = max(min(sd, max(cal["servo_open"], cal["servo_closed"])),
+                     min(cal["servo_open"], cal["servo_closed"]))
+            cmd[tidx[2]] = np.deg2rad(sd)
 
+            # IP flexion  → motor 3
+            raw = float(angles["Thumb"].get("pip", 0.0))
+            prev = self.previous_angles.get(("Thumb", "pip"))
+            sm = raw if prev is None else (1 - α) * prev + α * raw
+            self.previous_angles[("Thumb", "pip")] = sm
+            cal = self.calibration["Thumb"]["pip"]
+            ratio = (sm - cal["h_open"]) / (cal["h_closed"] - cal["h_open"])
+            sd = cal["servo_open"] + ratio * (cal["servo_closed"] - cal["servo_open"])
+            sd = max(min(sd, max(cal["servo_open"], cal["servo_closed"])),
+                     min(cal["servo_open"], cal["servo_closed"]))
+            cmd[tidx[3]] = np.deg2rad(sd)
+
+        # ---------- send & remember pose -------------------------
         self.leap_node.set_leap(lhu.angle_safety_clip(cmd))
+        self.current_command = cmd
 
     def update_mediapipe_image(self, photo):
         self.mediapipe_label.config(image=photo)
