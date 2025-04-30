@@ -105,14 +105,12 @@ class MediapipeStream:
 
     def stream_loop(self, update_callback, width, height):
         """
-        Capture → detect_async → wait for callback result → annotate → callback(annotated_image, angles)
-        Direct per-finger flexions/spans for Index/Middle/Ring, and for Thumb:
-          • CMC abduction (brings thumb toward/away from palm plane)
-          • MCP flexion
-          • IP flexion
-          • Twist (opposition)
-        Overlay drawn in smaller font.
+        Capture → detect_async → wait for callback result → annotate → callback(img, angles)
+
+        Uses a palm-centric frame (wrist + two MCPs) to remove global roll, so
+        rotating the whole forearm does NOT change finger angles.
         """
+        import numpy as np
         self.running = True
         self.start_capture()
 
@@ -121,26 +119,50 @@ class MediapipeStream:
         target_h = height * scale_factor
 
         while self.running:
-            ret, frame = self.capture.read()
-            if not ret:
+            ok, frame = self.capture.read()
+            if not ok:
                 continue
 
-            # BGR → RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_i = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             ts = int(time.time() * 1000)
-            self.landmarker.detect_async(mp_img, ts)
+            self.landmarker.detect_async(mp_i, ts)
 
             try:
                 result, _, _ = self._results.get(timeout=0.05)
             except queue.Empty:
                 continue
 
-            annotated = self.draw_landmarks(frame_rgb, result)
+            annotated = self.draw_landmarks(rgb, result)
             angles = {}
 
             if result.hand_landmarks:
+                # 1) fetch raw image-space landmarks
                 lm = [(p.x, p.y, p.z) for p in result.hand_landmarks[0]]
+
+                # 2) palm frame: wrist (0), index-MCP (5), pinky-MCP (17)
+                w = np.array(lm[0])
+                i_mcp = np.array(lm[5])
+                p_mcp = np.array(lm[17])
+
+                xv = i_mcp - w
+                yv = p_mcp - w
+                if np.linalg.norm(np.cross(xv, yv)) < 1e-4:
+                    xv = np.array([1.0, 0.0, 0.0])
+                    yv = np.array([0.0, 1.0, 0.0])
+
+                zv = np.cross(xv, yv);
+                zv /= np.linalg.norm(zv)
+                xv /= np.linalg.norm(xv)
+                yv = np.cross(zv, xv)
+                R = np.vstack([xv, yv, zv]).T  # world→palm
+
+                # 3) landmarks in palm frame
+                P = [(R.T @ (np.array(p) - w)) for p in lm]
+
+                # 4) angle helper
+                def ang(a, b, c):
+                    return calculate_angle(a, b, c)
 
                 fingers = {
                     'Thumb': None,
@@ -149,72 +171,95 @@ class MediapipeStream:
                     'Ring': [13, 14, 15, 16],
                 }
 
+                # 5) primary flexions & thumb-twist
                 for name in fingers:
                     if name == 'Thumb':
-                        # CMC abduction
-                        abd = get_smoothed_angle("Thumb_abd", calculate_angle(lm[4], lm[1], lm[17]))                        # MCP flexion
-                        mcp = get_smoothed_angle("Thumb_MCP", calculate_angle(lm[1], lm[2], lm[3]))
-                        # IP flexion
-                        pip = get_smoothed_angle("Thumb_IP", calculate_angle(lm[2], lm[3], lm[4]))
-                        # Twist opposition
-                        thumb_dir = np.array(lm[4]) - np.array(lm[2])
-                        index_dir = np.array(lm[8]) - np.array(lm[5])
-                        td = thumb_dir / (np.linalg.norm(thumb_dir) + 1e-6)
-                        idv = index_dir / (np.linalg.norm(index_dir) + 1e-6)
-                        tw_angle = int(np.degrees(np.arccos(np.clip(np.dot(td, idv), -1.0, 1.0))))
-                        twt = get_smoothed_angle("Thumb_twist", tw_angle)
+                        abd = get_smoothed_angle("Thumb_abd",
+                                                 ang(P[4], P[1], P[17]))
+                        mcp = get_smoothed_angle("Thumb_MCP",
+                                                 ang(P[1], P[2], P[3]))
+                        pip = get_smoothed_angle("Thumb_IP",
+                                                 ang(P[2], P[3], P[4]))
 
-                        angles['Thumb'] = {
-                            'abduction': abd,
-                            'mcp': mcp,
-                            'pip': pip,
-                            'twist': twt
-                        }
+                        # twist = angle between thumb (4-2) and index (8-5)
+                        td = P[4] - P[2]
+                        idv = P[8] - P[5]
+                        td /= np.linalg.norm(td)
+                        idv /= np.linalg.norm(idv)
+                        tw = int(np.degrees(np.arccos(
+                            np.clip(np.dot(td, idv), -1.0, 1.0))))
+                        tw = get_smoothed_angle("Thumb_twist", tw)
+
+                        angles['Thumb'] = dict(
+                            abduction=abd,
+                            mcp=mcp,
+                            pip=pip,
+                            twist=tw
+                        )
                     else:
                         idx = fingers[name]
-                        mcp = get_smoothed_angle(f"{name}_MCP",
-                                                 calculate_angle(lm[idx[0] - 1], lm[idx[0]], lm[idx[1]]))
-                        pip = get_smoothed_angle(f"{name}_PIP",
-                                                 calculate_angle(lm[idx[0]], lm[idx[1]], lm[idx[2]]))
-                        dip = get_smoothed_angle(f"{name}_DIP",
-                                                 calculate_angle(lm[idx[1]], lm[idx[2]], lm[idx[3]]))
-                        angles[name] = {'abduction': 0, 'mcp': mcp, 'pip': pip, 'dip': dip}
+                        mcp = get_smoothed_angle(
+                            f"{name}_MCP",
+                            ang(P[idx[0] - 1], P[idx[0]], P[idx[1]])
+                        )
+                        pip = get_smoothed_angle(
+                            f"{name}_PIP",
+                            ang(P[idx[0]], P[idx[1]], P[idx[2]])
+                        )
+                        dip = get_smoothed_angle(
+                            f"{name}_DIP",
+                            ang(P[idx[1]], P[idx[2]], P[idx[3]])
+                        )
+                        angles[name] = dict(mcp=mcp, pip=pip, dip=dip)
 
-                # spans for Index/Middle/Ring
-                angles['Index']['abduction'] = get_smoothed_angle("Index_abd",
-                                                                  calculate_angle(lm[6], lm[5], lm[9]))
-                angles['Middle']['abduction'] = get_smoothed_angle("Middle_abd",
-                                                                   calculate_angle(lm[10], lm[9], lm[13]))
-                angles['Ring']['abduction'] = get_smoothed_angle("Ring_abd",
-                                                                 calculate_angle(lm[18], lm[17], lm[13]))
+                # 6) abductions for I/M/R
+                angles['Index']['abduction'] = get_smoothed_angle(
+                    "Index_abd",
+                    ang(P[6], P[5], P[9]))
+                angles['Middle']['abduction'] = get_smoothed_angle(
+                    "Middle_abd",
+                    ang(P[10], P[9], P[13]))
+                angles['Ring']['abduction'] = get_smoothed_angle(
+                    "Ring_abd",
+                    ang(P[18], P[17], P[13]))
 
-            # build overlay
+            # 7) overlay text
             lines = []
             for f, v in angles.items():
                 if f == 'Thumb':
-                    lines.append(
-                        f"{f:6s} Abd {v['abduction']:3d}°  MCP {v['mcp']:3d}°  "
-                        f"PIP {v['pip']:3d}°  Twt {v['twist']:3d}°"
-                    )
+                    lines.append(f"{f:6s} Abd {v['abduction']:3d}°  MCP {v['mcp']:3d}°  "
+                                 f"PIP {v['pip']:3d}°  Twt {v['twist']:3d}°")
                 else:
-                    lines.append(
-                        f"{f:6s} Abd {v['abduction']:3d}°  MCP {v['mcp']:3d}°  "
-                        f"PIP {v['pip']:3d}°  DIP {v['dip']:3d}°"
-                    )
+                    lines.append(f"{f:6s} Abd {v['abduction']:3d}°  MCP {v['mcp']:3d}°  "
+                                 f"PIP {v['pip']:3d}°  DIP {v['dip']:3d}°")
 
-            annotated = overlay_text(
-                annotated, lines,
-                start_x=10, start_y=20,
-                font_scale=0.6, thickness=1, color=(0, 255, 0)
-            )
+            annotated = overlay_text(annotated, lines,
+                                     start_x=10, start_y=20,
+                                     font_scale=0.6, thickness=1,
+                                     color=(0, 255, 0))
+            annotated = cv2.resize(annotated,
+                                   (target_w, target_h),
+                                   interpolation=cv2.INTER_LINEAR)
 
-            annotated = cv2.resize(
-                annotated, (target_w, target_h),
-                interpolation=cv2.INTER_LINEAR
-            )
             update_callback(annotated, angles)
 
         self.stop_capture()
 
     def stop(self):
         self.running = False
+
+
+def proj_plane(v, n):
+    """project vector v on plane with normal n"""
+    n = n / (np.linalg.norm(n) + 1e-9)
+    return v - np.dot(v, n) * n
+
+
+def angle_plane(a, b, c, plane_n):
+    """
+    angle a-b-c measured **inside** the plane whose normal is plane_n
+    (used for abduction)
+    """
+    ba = proj_plane(a - b, plane_n)
+    bc = proj_plane(c - b, plane_n)
+    return calculate_angle(ba, np.zeros(3), bc)
