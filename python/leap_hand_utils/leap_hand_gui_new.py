@@ -1,5 +1,5 @@
 # leap_hand_gui_new.py
-
+import glob
 import threading
 import tkinter as tk
 import tkinter.ttk as ttk
@@ -13,13 +13,76 @@ from finger_teach_manager import FingerTeachManager
 from leap_node import LeapNode
 import leap_hand_utils as lhu
 from PIL import Image, ImageTk
-
 # Import the MediaPipe integration module.
 from mediapipe_integration import MediapipeStream
 
 # Global smoothing parameters.
 GLOBAL_SMOOTHING_STEPS = 30
 GLOBAL_SMOOTHING_DELAY = 20
+
+import os
+
+
+def find_available_cameras():
+    """
+    Scan only the /dev/video* entries that actually exist.
+    For each, read its name from sysfs, skip Intel/RealSense/Digit devices,
+    then attempt to open it to verify it returns a frame. Return a list of
+    (idx, label) where label = "idx: <device_name> (WxH)".
+    """
+    cams = []
+    blacklist = ("intel", "realsense", "digit")
+
+    # 1) List all /dev/video* nodes
+    video_nodes = glob.glob("/dev/video*")
+    for node in video_nodes:
+        # Extract the index from "/dev/videoN"
+        try:
+            idx = int(node.replace("/dev/video", ""))
+        except ValueError:
+            continue  # skip anything unexpected
+
+        # 2) Read device name from sysfs, if available
+        sysfs_path = f"/sys/class/video4linux/video{idx}/name"
+        if os.path.isfile(sysfs_path):
+            try:
+                with open(sysfs_path, "r") as f:
+                    cam_name = f.read().strip()
+            except Exception:
+                cam_name = "Unknown"
+        else:
+            cam_name = "Unknown"
+
+        # 3) Skip blacklisted devices
+        if any(b in cam_name.lower() for b in blacklist):
+            continue
+
+        # 4) Try opening with the default backend to confirm it works
+        cap = cv2.VideoCapture(idx)  # CAP_ANY
+        if not cap.isOpened():
+            cap.release()
+            continue
+
+        # Give the driver a short moment, then grab+retrieve
+        time.sleep(0.1)
+        if not cap.grab():
+            cap.release()
+            continue
+        ret, _ = cap.retrieve()
+        if not ret:
+            cap.release()
+            continue
+
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+        cap.release()
+
+        label = f"{idx}: {cam_name} ({w}×{h})"
+        cams.append((idx, label))
+
+    # Sort by index so dropdown is in ascending order
+    cams.sort(key=lambda x: x[0])
+    return cams
 
 
 class LeapHandGUI:
@@ -68,7 +131,7 @@ class LeapHandGUI:
 
         self.previous_angles = {}  # Store previous angles for each finger
         self.angle_update_threshold = 2  # degrees
-
+        self.camera_id = 0
         # --- Random Play Option Variables ---
         self.rand_thumb_var = tk.BooleanVar(value=False)
         self.rand_index_var = tk.BooleanVar(value=False)
@@ -101,27 +164,67 @@ class LeapHandGUI:
         )
         self.mediapipe_checkbox.pack(padx=5, pady=5, fill=tk.X)
 
-        # Create LeapNode instance.
-        self.leap_node = LeapNode()
-        self.leap_node.initialize_current_pose_from_motors()
+        self.available_cameras = find_available_cameras()
+        camera_labels = [label for (_, label) in self.available_cameras]
+        if not camera_labels:
+            camera_labels = ["(no cameras found)"]
 
-        # Compute safe pose.
+        tk.Label(self.left_frame, text="Select Camera:", font=("Arial", 10)).pack(anchor="w", padx=5)
+        self.camera_combo = ttk.Combobox(
+            self.left_frame,
+            values=camera_labels,
+            state="readonly",
+            width=30
+        )
+        self.camera_combo.pack(anchor="w", padx=5, pady=(0, 10))
+
+        # Default to the first available index (if any); otherwise -1
+        if self.available_cameras:
+            self.camera_combo.current(0)
+            self.camera_id = self.available_cameras[0][0]
+        else:
+            self.camera_combo.current(0)
+            self.camera_id = -1
+
+        def on_camera_selection(event):
+            sel = self.camera_combo.current()
+            if sel < len(self.available_cameras):
+                idx, _ = self.available_cameras[sel]
+                self.camera_id = idx
+                print(f"[GUI] camera_id updated to: {self.camera_id}")
+            else:
+                self.camera_id = -1
+                print("[GUI] no valid camera selected")
+
+        self.camera_combo.bind("<<ComboboxSelected>>", on_camera_selection)
+
+        self.hand_active_var = tk.BooleanVar(value=False)
+        self.activate_chk = tk.Checkbutton(
+            self.master,
+            text="Activate Hand",
+            variable=self.hand_active_var,
+            command=self.toggle_hand_activation
+        )
+        # You can choose where to pack it; here we just pack at the top.
+        self.activate_chk.pack(anchor="nw", padx=5, pady=5)
+
+        # Compute the “flat/safe” pose now, but do NOT move yet. Store it for later.
         flat_pose_rad = lhu.allegro_to_LEAPhand(np.zeros(16))
         flat_pose_deg = np.rad2deg(flat_pose_rad)
         for idx in [1, 5, 9]:
             flat_pose_deg[idx] = 94
         self.default_pose = np.deg2rad(flat_pose_deg)
         safe_pose = lhu.angle_safety_clip(self.default_pose)
-        # Compute safe_pose in degrees for use in the sliders.
-        safe_pose_deg = np.rad2deg(safe_pose)
+        self.safe_pose = safe_pose.copy()
+        self.safe_pose_deg = np.rad2deg(safe_pose)
+        # self.current_command = np.copy(safe_pose)
 
-        # Initialize a persistent command vector to hold desired positions.
-        self.current_command = np.copy(safe_pose)
+        self.leap_node = None
+        self.robot_initialized = False
+        self.safe_pose = None
+        self.default_pose = None
 
-        self.leap_node.pause_control_loop()
-        self.move_to_pose(safe_pose, override_safety=True)
-        print("[GUI] Initialized LeapNode with default pose:", self.default_pose)
-        self.leap_node.resume_control_loop()
+        print("[GUI] LeapNode initialized but NOT active. Check-box must be ticked to move hand.")
 
         # Create the contact detection panel.
         self.create_contact_status_panel()
@@ -153,7 +256,7 @@ class LeapHandGUI:
                 s = tk.Scale(self.pos_slider_frame, from_=0, to=360, orient=tk.HORIZONTAL,
                              resolution=1, length=250,
                              command=lambda v, idx=joint_index: self.position_slider_changed(idx, v))
-                s.set(safe_pose_deg[joint_index])
+                s.set(self.safe_pose_deg[joint_index])
                 s.grid(row=row + 2, column=col + 1, padx=5, pady=5)
                 self.sliders[joint_index] = s
 
@@ -410,8 +513,57 @@ class LeapHandGUI:
             self.traj_listbox.curselection()[0]
             if self.traj_listbox.curselection() else None))
 
+    def toggle_hand_activation(self):
+        """
+        Called whenever the “Activate Hand” checkbox is toggled.
+        If checked: initialize robot (if needed), move to safe pose, then resume loop.
+        If unchecked: pause control loop (if robot exists).
+        """
+        if self.hand_active_var.get():
+            # 1) If robot not yet initialized, do it now:
+            if not self.robot_initialized:
+                try:
+                    self.leap_node = LeapNode()
+                    self.leap_node.initialize_current_pose_from_motors()
+                    self.robot_initialized = True
+                    print("[GUI] LeapNode initialized. Now activating hand.")
+                except Exception as e:
+                    print("[GUI] Error initializing robot:", e)
+                    # Uncheck the box automatically since robot isn't present
+                    self.hand_active_var.set(False)
+                    return
+
+            # 2) Now that robot exists, move to safe pose and resume loop
+            try:
+                self.leap_node.pause_control_loop()
+                self.move_to_pose(self.safe_pose, override_safety=True)
+                self.leap_node.resume_control_loop()
+                print("[GUI] Hand ACTIVATED. Control loop running.")
+            except Exception as e:
+                print("[GUI] Error activating hand:", e)
+
+        else:
+            # When user unchecks the box: pause control loop (if robot exists)
+            if self.robot_initialized and self.leap_node:
+                try:
+                    self.leap_node.pause_control_loop()
+                    print("[GUI] Hand DEACTIVATED. No further commands will be sent.")
+                except Exception as e:
+                    print("[GUI] Error deactivating hand:", e)
+            else:
+                # Robot was never initialized, nothing to do
+                print("[GUI] Hand checkbox unchecked, but robot was never initialized.")
+
+
     def toggle_mediapipe_stream(self):
         if self.mediapipe_enabled.get():
+            # Only start Mediapipe if a valid camera_id has been chosen
+            if self.camera_id < 0:
+                print("[GUI] Cannot start Mediapipe: no camera selected.")
+                # Uncheck the box automatically
+                self.mediapipe_enabled.set(False)
+                return
+
             self.show_teleop_checkboxes()
             self.start_mediapipe_stream()
         else:
@@ -456,7 +608,7 @@ class LeapHandGUI:
         self.mediapipe_label.pack(side=tk.TOP, pady=5)
 
         # Instantiate and start the MediaPipe stream thread
-        self.mediapipe_stream = MediapipeStream()
+        self.mediapipe_stream = MediapipeStream(self.camera_id)
         self.mediapipe_thread = threading.Thread(
             target=self.mediapipe_stream_loop,
             daemon=True
@@ -482,18 +634,28 @@ class LeapHandGUI:
         from PIL import Image, ImageTk
 
         def callback(img, angles):
-            # display
-            photo = ImageTk.PhotoImage(Image.fromarray(img))
+            # 1) Display the image
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            photo = ImageTk.PhotoImage(Image.fromarray(img_rgb))
             self.mediapipe_label.after(0, lambda p=photo: self.update_mediapipe_image(p))
 
-            # only apply if teleop is on and we actually detected a hand
+            # 2) If teleop is on and we detected angles, print & apply
             if self.mediapipe_enabled.get() and angles:
                 print("[GUI] Human hand angles:", angles)
-                default_pose_deg = np.round(np.rad2deg(self.default_pose))
-                print("[GUI] Robot hand angles:", default_pose_deg)
+
+                # Only print robot angles if default_pose is defined
+                if self.default_pose is not None:
+                    default_pose_deg = np.round(np.rad2deg(self.default_pose))
+                    print("[GUI] Robot hand angles:", default_pose_deg)
+
+                # Schedule the application of the new angles to the robot (if active)
                 self.master.after(0, lambda a=angles: self.apply_mediapipe_angles(a))
 
-        w, h = self.stream_width_var.get(), self.stream_height_var.get()
+        # Compute display size
+        w = self.stream_width_var.get() * 3
+        h = self.stream_height_var.get() * 3
+
+        # Enter the Mediapipe‐capture loop
         self.mediapipe_stream.stream_loop(callback, w, h)
 
     def apply_mediapipe_angles(self, angles):
@@ -594,8 +756,9 @@ class LeapHandGUI:
             cmd[tidx[3]] = np.deg2rad(sd)
 
         # ---------- send & remember pose -------------------------
-        self.leap_node.set_leap(lhu.angle_safety_clip(cmd))
-        self.current_command = cmd
+        if self.hand_active_var.get():
+            self.leap_node.set_leap(lhu.angle_safety_clip(cmd))
+            self.current_command = cmd
 
     def update_mediapipe_image(self, photo):
         self.mediapipe_label.config(image=photo)
@@ -624,6 +787,18 @@ class LeapHandGUI:
         }
 
     def update_contact_status(self):
+        """
+        If the robot exists, read motor currents and update contact labels.
+        Otherwise, show 'N/A'. Always reschedule itself after 200 ms.
+        """
+        # If the robot is not initialized yet, show “N/A” and reschedule
+        if not (self.robot_initialized and self.leap_node):
+            for finger in self.finger_tip_map:
+                self.contact_status_labels[finger].config(text=f"{finger}: N/A", fg="gray")
+            self.master.after(200, self.update_contact_status)
+            return
+
+        # At this point, leap_node exists:
         try:
             currents = self.leap_node.dxl_client.read_cur()
             threshold = 34
@@ -633,22 +808,25 @@ class LeapHandGUI:
                     if current_value > threshold:
                         text = f"{finger}: {current_value:.2f} (Contact)"
                         self.contact_status_labels[finger].config(text=text, fg="red")
-                        print(f"Contact detected on {finger}: {current_value:.2f} (above {threshold})")
                     else:
                         text = f"{finger}: {current_value:.2f} (No Contact)"
                         self.contact_status_labels[finger].config(text=text, fg="green")
                 else:
+                    # If `read_cur()` returned None for some reason
                     self.contact_status_labels[finger].config(text=f"{finger}: Unknown", fg="orange")
-                    print(f"{finger} current: Unknown")
         except Exception as e:
             print("Error updating contact status:", e)
-        self.master.after(200, self.update_contact_status)
+        finally:
+            # Always reschedule
+            self.master.after(200, self.update_contact_status)
 
     def position_slider_changed(self, idx, value):
         try:
             angle_deg = float(value)
             self.current_command[idx] = np.deg2rad(angle_deg)
-            self.leap_node.set_leap(self.current_command)
+            # Only send the new pose if the hand is activated:
+            if self.hand_active_var.get():
+                self.leap_node.set_leap(self.current_command)
         except Exception as e:
             print(f"Error in position_slider_changed for joint {idx}: {e}")
 
@@ -700,15 +878,38 @@ class LeapHandGUI:
             return None
 
     def update_current_positions(self):
-        self.read_positions()
-        self.master.after(1000, self.update_current_positions)
+        """
+        Called every second to read the robot’s current joint positions and update sliders.
+        If the robot is not initialized, simply reschedule without doing anything.
+        """
+        # If the robot is not initialized, just reschedule
+        if not (self.robot_initialized and self.leap_node):
+            self.master.after(1000, self.update_current_positions)
+            return
+
+        # At this point, the robot exists
+        try:
+            current_pose_rad = self.leap_node.read_pos()
+            if current_pose_rad is not None:
+                current_pose_deg = np.rad2deg(current_pose_rad)
+                for i, slider in enumerate(self.sliders):
+                    slider.set(current_pose_deg[i])
+        except Exception as e:
+            print("Error reading positions:", e)
+        finally:
+            # Always reschedule
+            self.master.after(1000, self.update_current_positions)
 
     def move_to_pose(self, target_pose, steps=None, delay=None, override_safety=False):
+        # We assume this is only called when hand_active_var is True,
+        # so you can either put a guard here, or rely on toggle_hand_activation
+        # to be the only caller before activation.
         current_pose = self.leap_node.curr_pos.copy()
         if steps is None:
             steps = GLOBAL_SMOOTHING_STEPS
         if delay is None:
             delay = GLOBAL_SMOOTHING_DELAY
+
         self.leap_node.pause_control_loop()
         for i in range(1, steps + 1):
             t = i / steps
@@ -795,20 +996,30 @@ class LeapHandGUI:
             self.stop_rand_button.config(state=tk.DISABLED)
 
     def on_closing(self):
-        flat_pose_rad = lhu.allegro_to_LEAPhand(np.zeros(16))
-        flat_pose_deg = np.rad2deg(flat_pose_rad)
-        for idx in [1, 5, 9]:
-            flat_pose_deg[idx] = 94
-        safe_pose = np.deg2rad(flat_pose_deg)
-        self.move_to_pose(safe_pose, override_safety=True)
+        # Only move to the safe pose if the hand was active
+        if self.hand_active_var.get():
+            flat_pose_rad = lhu.allegro_to_LEAPhand(np.zeros(16))
+            flat_pose_deg = np.rad2deg(flat_pose_rad)
+            for idx in [1, 5, 9]:
+                flat_pose_deg[idx] = 94
+            safe_pose = np.deg2rad(flat_pose_deg)
+            try:
+                self.move_to_pose(safe_pose, override_safety=True)
+            except Exception as e:
+                print("Error moving to safe pose on exit:", e)
+
+        # Disable torque regardless of whether the hand was active
         try:
             self.leap_node.dxl_client.set_torque_enabled(self.leap_node.motors, False)
         except Exception as e:
             print("Error disabling torque:", e)
+
+        # Disconnect any sensors
         try:
             self.sensor_manager.disconnect_all()
         except Exception as e:
             print("Error disconnecting sensors:", e)
+
         self.master.destroy()
 
 
