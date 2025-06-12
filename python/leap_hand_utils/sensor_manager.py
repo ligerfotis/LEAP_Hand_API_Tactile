@@ -18,9 +18,12 @@ class SensorManager:
         self.realsense_pipeline = rs.pipeline()
         self.realsense_config = rs.config()
         self.realsense_started = False
+        self.rs_available = False  # ← new flag for camera
 
         # Dictionary to hold DIGIT sensor objects.
         self.sensors = {}
+        self.digits_available = False  # ← new flag for any DIGIT sensors
+
         # Callback functions: (set these from your GUI)
         self.live_update_callback = None  # For RealSense camera live updates.
         self.tactile_live_update_callback = None  # For DIGIT sensor live updates.
@@ -37,6 +40,12 @@ class SensorManager:
         }
 
     def start_realsense(self):
+        ctx = rs.context()
+        devices = ctx.query_devices()
+        if len(devices) == 0:
+            # no device plugged in — skip start
+            print("No RealSense device detected.  Skipping start().")
+            return False
         if not self.realsense_started:
             width = self.stream_width_var.get()
             height = self.stream_height_var.get()
@@ -49,21 +58,27 @@ class SensorManager:
                 print(f"[RealSense] Failed to start pipeline: {e}")
 
     def setup_digit_sensors(self, _unused_container):
-        # Initialize DIGIT sensors without creating any UI elements.
         for finger, serial in self.finger_sensor_serials.items():
             try:
                 sensor = Digit(serial)
                 sensor.connect()
                 sensor.set_fps(Digit.STREAMS["VGA"]["fps"]["15fps"])
                 self.sensors[finger] = sensor
+                self.digits_available = True
             except Exception as e:
-                print(f"[SensorManager] Error connecting {finger} sensor ({serial}): {e}")
-        threading.Thread(target=self.update_sensor_images, daemon=True).start()
+                print(f"[SensorManager] Skipping {finger} ({serial}): {e}")
+        if self.digits_available:
+            threading.Thread(target=self.update_sensor_images, daemon=True).start()
+        else:
+            print("[SensorManager] No DIGIT sensors; tactile stream disabled.")
 
     def setup_realsense_stream(self, _unused_container):
-        # Start the RealSense stream.
         self.start_realsense()
-        threading.Thread(target=self.update_camera_stream, daemon=True).start()
+        if self.realsense_started:
+            self.rs_available = True
+            threading.Thread(target=self.update_camera_stream, daemon=True).start()
+        else:
+            print("[SensorManager] RealSense unavailable; camera stream disabled.")
 
     def update_sensor_images(self):
         # Continuously update DIGIT sensor images.
@@ -81,7 +96,7 @@ class SensorManager:
         # Continuously update the RealSense camera stream.
         while True:
             try:
-                frames = self.realsense_pipeline.wait_for_frames()
+                frames = self.realsense_pipeline.wait_for_frames(timeout_ms=500)
                 color_frame = frames.get_color_frame()
                 if not color_frame:
                     continue
@@ -93,7 +108,8 @@ class SensorManager:
                 if self.live_update_callback:
                     self.live_update_callback(img)
             except Exception as e:
-                print(f"[RealSense] Streaming error: {e}")
+                print(f"[RealSense] Streaming error, disabling: {e}")
+                self.rs_available = False
             time.sleep(0.03)
 
     def get_realsense_frame(self):

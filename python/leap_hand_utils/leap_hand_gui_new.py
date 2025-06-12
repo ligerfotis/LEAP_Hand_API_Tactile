@@ -19,7 +19,8 @@ from mediapipe_integration import MediapipeStream
 # Global smoothing parameters.
 GLOBAL_SMOOTHING_STEPS = 30
 GLOBAL_SMOOTHING_DELAY = 20
-
+import pybullet as p
+import pybullet_data
 import os
 
 
@@ -87,6 +88,8 @@ def find_available_cameras():
 
 class LeapHandGUI:
     def __init__(self, master):
+        self.live_containers = []  # initialize as an empty list, not None
+
         self.master = master
         master.title("LEAP Hand Real-Time Control GUI")
 
@@ -150,9 +153,10 @@ class LeapHandGUI:
 
         # Main layout frames.
         self.left_frame = tk.Frame(master)
-        self.left_frame.pack(side=tk.LEFT, padx=10, pady=10, fill=tk.BOTH, expand=True)
+        self.left_frame.pack(side=tk.LEFT, padx=10, pady=10, fill=tk.Y, expand=False)
+        # self.left_frame.config(width=250)
         self.right_frame = tk.Frame(master)
-        self.right_frame.pack(side=tk.RIGHT, padx=10, pady=10, fill=tk.BOTH, expand=True)
+        # self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=10, pady=10)
 
         # --- Mediapipe Teleop Stream Toggle ---
         self.mediapipe_enabled = tk.BooleanVar(value=False)
@@ -163,6 +167,45 @@ class LeapHandGUI:
             command=self.toggle_mediapipe_stream
         )
         self.mediapipe_checkbox.pack(padx=5, pady=5, fill=tk.X)
+
+        # In LeapHandGUI.__init__, after loading URDF & before building joint_map:
+        self.human_cal = {
+            "Thumb": {
+                "abd": {"h_open": 93.0, "h_closed": 50.0},
+                "mcp": {"h_open": 172.0, "h_closed": 155.0},
+                "pip": {"h_open": 159.0, "h_closed": 112.0},
+                "twist": {"h_open": 53.0, "h_closed": 127.0},
+                # we’ll skip twist in joint_map for now
+            },
+            "Index": {
+                "abd": {"h_open": 79.0, "h_closed": 142.0},
+                "mcp": {"h_open": 105.0, "h_closed": 28.0},
+                "pip": {"h_open": 175.0, "h_closed": 102.0},
+                "dip": {"h_open": 176.0, "h_closed": 104.0},
+            },
+            "Middle": {
+                "abd": {"h_open": 98.0, "h_closed": 110.0},
+                "mcp": {"h_open": 18.0, "h_closed": 14.0},
+                "pip": {"h_open": 174.0, "h_closed": 116.0},
+                "dip": {"h_open": 177.0, "h_closed": 67.0},
+            },
+            "Ring": {
+                "abd": {"h_open": 109.0, "h_closed": 95.0},
+                "mcp": {"h_open": 17.0, "h_closed": 25.0},
+                "pip": {"h_open": 176.0, "h_closed": 113.0},
+                "dip": {"h_open": 175.0, "h_closed": 74.0},
+            },
+        }
+
+        # Button: record “hand open” pose
+        btn_open = tk.Button(self.left_frame, text="Calibrate Open Pose",
+                             command=lambda: self.record_calibration("open"))
+        btn_open.pack(fill=tk.X, padx=5, pady=(10, 2))
+
+        # Button: record “fist closed” pose
+        btn_closed = tk.Button(self.left_frame, text="Calibrate Closed Pose",
+                               command=lambda: self.record_calibration("closed"))
+        btn_closed.pack(fill=tk.X, padx=5, pady=(2, 10))
 
         self.available_cameras = find_available_cameras()
         camera_labels = [label for (_, label) in self.available_cameras]
@@ -221,10 +264,137 @@ class LeapHandGUI:
 
         self.leap_node = None
         self.robot_initialized = False
-        self.safe_pose = None
-        self.default_pose = None
 
         print("[GUI] LeapNode initialized but NOT active. Check-box must be ticked to move hand.")
+
+        # ─────────────────────────────────────────────────────────────────
+        # 2) Initialize PyBullet (DIRECT) & load the LEAP Hand URDF
+        # ─────────────────────────────────────────────────────────────────
+
+        # 2A) Start the physics server in headless mode
+        self._pb_client = p.connect(p.GUI)
+        # Optionally, add a small plane or use p.GUI if you want to visualize.
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=self._pb_client)
+        p.setGravity(0, 0, 0, physicsClientId=self._pb_client)
+
+        # 2B) Specify the path to your URDF (the one you copied under urdfs/leap_robot)
+        leap_urdf_path = "python/leap_hand_utils/urdfs/leap_hand/robot.urdf"
+
+        # 2C) Load the URDF with self‐collision enabled; useFixedBase=1 so it doesn’t fall
+        # Correct (positional arguments for basePosition and baseOrientation):
+        base_position = [0, 0, 0]  # Must be a 3-element list :contentReference[oaicite:2]{index=2}
+        base_orientation = [1, 0, 0, 0]  # Identity quaternion (x,y,z,w) :contentReference[oaicite:3]{index=3}
+        use_fixed_base = 1  # 1 means the hand will stay fixed (no gravity effect)
+        flags = p.URDF_USE_SELF_COLLISION  # Enable internal link–link collisions
+
+        # If using default physicsClientId:
+        self.hand_id = p.loadURDF(
+            leap_urdf_path,
+            base_position,
+            base_orientation,
+            use_fixed_base,
+            flags
+        )
+        # ─── 1) Define the official home‐pose joint angles ───
+        home = {
+            0: 0.0, 1: 1.047, 2: 0.506, 3: 0.366,  # Index
+            4: 0.0, 5: 1.047, 6: 0.506, 7: 0.366,  # Middle
+            8: 0.0, 9: 1.047, 10: 0.506, 11: 0.366,  # Ring
+            12: 0.349, 13: 2.443, 14: 1.900, 15: 1.880,  # Thumb
+        }
+
+        # ─── 2) Reset each joint kinematically to that home pose ───
+        for ji, angle in home.items():
+            p.resetJointState(self.hand_id, ji, angle, 0)
+
+        # ─── 3) Step the sim so you see the home pose in GUI ───
+        p.stepSimulation()
+
+        # 2D) Cache all revolute/prismatic (DOF) joint indices and their limits
+        num_joints = p.getNumJoints(self.hand_id)
+        self._joint_names = []
+        for ji in range(num_joints):
+            info = p.getJointInfo(self.hand_id, ji)
+            name = info[1].decode("utf-8")
+            self._joint_names.append(name)
+
+        # 2) Create a name → PyBullet index map
+        self.urdf_name_to_pb_index = {
+            self._joint_names[ji]: ji for ji in range(num_joints)
+        }
+
+        # 3) Build the explicit mapping from your 16-element cmd array to PB joint indices
+        #    (Change these strings to match exactly what you saw in the printout!)
+        self.cmd_to_pb_index = {
+            # Index finger:
+            0: self.urdf_name_to_pb_index["0"],  # “0” in URDF = Index_abd
+            1: self.urdf_name_to_pb_index["1"],  # “1” in URDF = Index_mcp
+            2: self.urdf_name_to_pb_index["2"],  # “2” in URDF = Index_pip
+            3: self.urdf_name_to_pb_index["3"],  # “3” in URDF = Index_dip
+
+            # Middle finger:
+            4: self.urdf_name_to_pb_index["4"],  # “4” in URDF = Middle_abd
+            5: self.urdf_name_to_pb_index["5"],  # “5” in URDF = Middle_mcp
+            6: self.urdf_name_to_pb_index["6"],  # “6” in URDF = Middle_pip
+            7: self.urdf_name_to_pb_index["7"],  # “7” in URDF = Middle_dip
+
+            # Ring finger:
+            8: self.urdf_name_to_pb_index["8"],  # “8” in URDF = Ring_abd
+            9: self.urdf_name_to_pb_index["9"],  # “9” in URDF = Ring_mcp
+            10: self.urdf_name_to_pb_index["10"],  # “10” in URDF = Ring_pip
+            11: self.urdf_name_to_pb_index["11"],  # “11” in URDF = Ring_dip
+
+            # Thumb:
+            12: self.urdf_name_to_pb_index["12"],  # “12” in URDF = Thumb_abd
+            13: self.urdf_name_to_pb_index["13"],  # “13” in URDF = Thumb_mcp
+            14: self.urdf_name_to_pb_index["14"],  # “14” in URDF = Thumb_pip
+            15: self.urdf_name_to_pb_index["15"],  # “15” in URDF = Thumb_dip
+        }
+        # Build a set of link‐index pairs that you WANT to ignore (adjacent links)
+        self._allowed_self_collisions = set()
+
+        # For each revolute joint, we know `parent` and `child` link indices:
+        for ji in range(p.getNumJoints(self.hand_id)):
+            info = p.getJointInfo(self.hand_id, ji)
+            parent_link = info[16]  # index of the parent link
+            child_link = info[0]  # joint index is also the child link index
+            # Allow contacts between parent_link and child_link
+            self._allowed_self_collisions.add((parent_link, child_link))
+            self._allowed_self_collisions.add((child_link, parent_link))
+
+        # 4) Cache pb_joint_limits for every DOF joint
+        self.pb_joint_limits = {}
+        for pb_idx in self.cmd_to_pb_index.values():
+            info = p.getJointInfo(self.hand_id, pb_idx)
+            lo, hi = info[8], info[9]
+            self.pb_joint_limits[pb_idx] = (lo, hi)
+
+        # 5) Build linear maps A,B for every cmd_idx including Thumb DIP
+        # Build per‐joint linear maps: sim_angle = A * human_rad + B
+        self.joint_map = {}
+
+        for finger, base_idx in [("Index", 0), ("Middle", 4), ("Ring", 8), ("Thumb", 12)]:
+            for i, joint_key in enumerate(["abd", "mcp", "pip", "dip"]):
+                # Skip Thumb DIP if your model doesn’t use it:
+                if finger == "Thumb" and joint_key == "dip":
+                    continue
+
+                # Human endpoints in degrees
+                h_open = self.human_cal[finger][joint_key]["h_open"]
+                h_closed = self.human_cal[finger][joint_key]["h_closed"]
+                ro, rc = np.deg2rad(h_open), np.deg2rad(h_closed)
+
+                cmd_idx = base_idx + i
+                pb_idx = self.cmd_to_pb_index[cmd_idx]
+                lo, hi = self.pb_joint_limits[pb_idx]
+
+                # Solve A·ro + B = hi  and  A·rc + B = lo
+                A = (lo - hi) / (rc - ro)
+                B = hi - A * ro
+
+                self.joint_map[cmd_idx] = (A, B)
+                print(f"{finger}.{joint_key}: map {h_open}°→{np.degrees(hi):.1f}°, "
+                      f"{h_closed}°→{np.degrees(lo):.1f}°")
 
         # Create the contact detection panel.
         self.create_contact_status_panel()
@@ -248,6 +418,11 @@ class LeapHandGUI:
             header = tk.Label(self.pos_slider_frame, text=finger, font=("Arial", 10, "bold"))
             header.grid(row=1, column=col + 1, padx=5, pady=5)
 
+        self.index_deg_limits = {
+            i: (np.degrees(lo), np.degrees(hi))
+            for i, (lo, hi) in self.pb_joint_limits.items()
+            if i < 4
+        }
         for row, joint in enumerate(joint_names):
             joint_label = tk.Label(self.pos_slider_frame, text=joint, width=12)
             joint_label.grid(row=row + 2, column=0, padx=5, pady=5)
@@ -395,13 +570,22 @@ class LeapHandGUI:
         self.live_labels = {}
         self.playback_labels = {}
         for i, stream in enumerate(self.stream_names):
-            live_col_frame = tk.Frame(self.live_frame, borderwidth=2, relief=tk.GROOVE)
-            live_col_frame.grid(row=0, column=i, padx=5, sticky="n")
-            tk.Label(live_col_frame, text=stream, font=("Arial", 12, "bold")).pack(side=tk.TOP, pady=2)
-            self.live_labels[stream] = tk.Label(live_col_frame, text="LIVE", bg="black",
-                                                width=self.stream_width_var.get(), height=self.stream_height_var.get(),
-                                                fg="red")
-            self.live_labels[stream].pack(side=tk.TOP, pady=5)
+            # Create a plain tk.Frame container (so we can size it later)
+            container = tk.Frame(self.live_frame, borderwidth=2, relief=tk.GROOVE)
+            container.grid(row=0, column=i, padx=5, sticky="n")
+            container.pack_propagate(True)  # disable auto‐resize
+            self.live_containers.append(container)  # collect for size‐locking
+            container.configure(width = self.stream_width_var.get(),  # or hard-code 640
+                                height = self.stream_height_var.get()  # or hard-code 480
+            )
+            # Title label stays the same
+            tk.Label(container, text=stream, font=("Arial", 12, "bold")).pack(side=tk.TOP, pady=2)
+
+            # The actual image Label has no fixed width/height
+            lbl = tk.Label(container, text="LIVE", bg="black", fg="red")
+            lbl.pack(fill=tk.BOTH, expand=True, pady=5)
+            self.live_labels[stream] = lbl
+
         for i, stream in enumerate(self.stream_names):
             playback_col_frame = tk.Frame(self.playback_frame, borderwidth=2, relief=tk.GROOVE)
             playback_col_frame.grid(row=0, column=i, padx=5, sticky="n")
@@ -460,11 +644,27 @@ class LeapHandGUI:
         self.sensor_manager = SensorManager(self.master, self.stream_width_var, self.stream_height_var)
         self.sensor_manager.live_update_callback = lambda frame: self.update_live_image("Camera", frame)
         self.sensor_manager.tactile_live_update_callback = lambda finger, frame: self.update_live_image(finger, frame)
+        # self.sensor_manager.setup_digit_sensors(self.right_frame)
+        # self.sensor_manager.setup_realsense_stream(self.right_frame)
+        # hook up sensors & camera (unchanged)
         self.sensor_manager.setup_digit_sensors(self.right_frame)
         self.sensor_manager.setup_realsense_stream(self.right_frame)
 
+        # ── FORCE FIXED SIZE ON ALL STREAM PANES ──
+        # pack the right panel (unchanged)
+        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Now lock only the *tk.Frame* containers you’ll create below,
+        # not the Label widgets themselves.
+        for container in self.live_containers:
+            container.config(
+                width=self.stream_width_var.get(),
+                height=self.stream_height_var.get()
+            )
+
         self.size_frame = tk.Frame(self.right_frame)
         self.size_frame.pack(side=tk.TOP, padx=5, pady=5)
+
         tk.Label(self.size_frame, text="Stream Width:").pack(side=tk.LEFT)
         tk.Spinbox(self.size_frame, from_=160, to=1280, increment=16,
                    textvariable=self.stream_width_var, width=5, command=self.update_stream_dimensions).pack(
@@ -513,6 +713,15 @@ class LeapHandGUI:
             self.traj_listbox.curselection()[0]
             if self.traj_listbox.curselection() else None))
 
+        # DEBUG: Print joint info for debugging
+        print("Joint limits (rad):")
+        for pb_idx in sorted(self.cmd_to_pb_index.values()):
+            lo, hi = self.pb_joint_limits[pb_idx]
+            print(f"  Joint {pb_idx}: [{lo:.2f}, {hi:.2f}] rad "
+                  f"({np.degrees(lo):.1f}° → {np.degrees(hi):.1f}°)")
+        self.prev_cmd_deg = self.safe_pose_deg.copy()
+
+
     def toggle_hand_activation(self):
         """
         Called whenever the “Activate Hand” checkbox is toggled.
@@ -553,7 +762,6 @@ class LeapHandGUI:
             else:
                 # Robot was never initialized, nothing to do
                 print("[GUI] Hand checkbox unchecked, but robot was never initialized.")
-
 
     def toggle_mediapipe_stream(self):
         if self.mediapipe_enabled.get():
@@ -634,23 +842,34 @@ class LeapHandGUI:
         from PIL import Image, ImageTk
 
         def callback(img, angles):
-            # 1) Display the image
+            # 1) Display the image as before
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             photo = ImageTk.PhotoImage(Image.fromarray(img_rgb))
             self.mediapipe_label.after(0, lambda p=photo: self.update_mediapipe_image(p))
 
-            # 2) If teleop is on and we detected angles, print & apply
+            # 2) If teleop is enabled and we have angles, print human vs commanded
             if self.mediapipe_enabled.get() and angles:
-                print("[GUI] Human hand angles:", angles)
+                self.last_human_angles = angles.copy()
+                # Print human‐detected angles:
+                print("\n[Human]  Detected joint angles (degrees):")
+                for finger, sub in angles.items():
+                    # e.g. sub = {'mcp': 63, 'pip': 159, ...}
+                    print(f"  {finger}: ", ", ".join(f"{k}={v:.1f}°" for k, v in sub.items()))
 
-                # Only print robot angles if default_pose is defined
-                if self.default_pose is not None:
-                    default_pose_deg = np.round(np.rad2deg(self.default_pose))
-                    print("[GUI] Robot hand angles:", default_pose_deg)
+                # Build your 16‐element cmd_deg array exactly as in apply_mediapipe_angles:
+                cmd_deg = self.compute_cmd_deg(angles)
 
-                # Schedule the application of the new angles to the robot (if active)
-                self.master.after(0, lambda a=angles: self.apply_mediapipe_angles(a))
+                print("[Command] Fresh servo commands (deg):")
+                for i, finger in enumerate(["Index", "Middle", "Ring", "Thumb"]):
+                    block = cmd_deg[i * 4:(i + 1) * 4]
+                    print(f"  {finger}: {' , '.join(f'{ang:.1f}°' for ang in block)}")
 
+                # 2) Now call apply, passing in both cmd_deg and angles
+                self.master.after(0, lambda a=angles, c=cmd_deg: self.apply_mediapipe_angles(a, c))
+
+        w = self.stream_width_var.get() * 3
+        h = self.stream_height_var.get() * 3
+        self.mediapipe_stream.stream_loop(callback, w, h)
         # Compute display size
         w = self.stream_width_var.get() * 3
         h = self.stream_height_var.get() * 3
@@ -658,15 +877,49 @@ class LeapHandGUI:
         # Enter the Mediapipe‐capture loop
         self.mediapipe_stream.stream_loop(callback, w, h)
 
-    def apply_mediapipe_angles(self, angles):
+    def compute_cmd_deg(self, angles: dict[str, dict[str, float]]) -> np.ndarray:
         """
-        Per-finger tele-operation gated by check-boxes.
+        From the Mediapipe `angles` dict (in degrees), compute
+        the 16-element servo‐degree command array, before mapping.
+        """
+        cmd_deg = np.zeros(16, dtype=float)
+        α = 0.1
 
-        Only fingers whose BooleanVar is checked ( .get() == True )
-        are updated from Mediapipe; all others stay exactly where
-        they were (self.current_command).
+        # Thumb (cmd indices 12–15)
+        if 'Thumb' in angles:
+            a = angles['Thumb']['abduction']
+            m = angles['Thumb']['mcp']
+            p1 = angles['Thumb']['pip']
+            # twist ignored for now or map to cmd[15] if you like
+            cmd_deg[12] = (1 - α) * self.prev_cmd_deg[12] + α * a
+            cmd_deg[13] = (1 - α) * self.prev_cmd_deg[13] + α * m
+            cmd_deg[14] = (1 - α) * self.prev_cmd_deg[14] + α * p1
+            cmd_deg[15] = cmd_deg[15]  # or handle twist
 
-        If no hand, or no check-boxes ticked, we do nothing.
+        # Then Index (0–3), Middle (4–7), Ring (8–11) similarly:
+        for i, finger in enumerate(['Index', 'Middle', 'Ring']):
+            base = i * 4
+            if finger in angles:
+                # abduction only for Index/Middle/Ring at index 0 of each block
+                abd = angles[finger]['abduction']
+                mcp = angles[finger]['mcp']
+                pip = angles[finger]['pip']
+                dip = angles[finger]['dip']
+                cmd_deg[base + 0] = (1 - α) * self.prev_cmd_deg[base + 0] + α * abd
+                cmd_deg[base + 1] = (1 - α) * self.prev_cmd_deg[base + 1] + α * mcp
+                cmd_deg[base + 2] = (1 - α) * self.prev_cmd_deg[base + 2] + α * pip
+                cmd_deg[base + 3] = (1 - α) * self.prev_cmd_deg[base + 3] + α * dip
+
+        # Store for smoothing next time
+        self.prev_cmd_deg = cmd_deg.copy()
+        return cmd_deg
+
+    def apply_mediapipe_angles(self, angles,cmd_deg):
+        """
+        1) Build a 16-element 'cmd' array (in radians) from Mediapipe angles + calibration.
+        2) Kinematically reset those joint angles in PyBullet.
+        3) Step simulation and check for any link–link self-collisions.
+        4) If collision→reject; else→send to real robot or store locally.
         """
         # ── Guard clauses ────────────────────────────────────────
         if not angles or not hasattr(self, "teleop_vars"):
@@ -702,6 +955,9 @@ class LeapHandGUI:
 
                 idx = self.fingers[finger][pos]
                 cmd[idx] = np.deg2rad(sd)
+                # print degrees and radians for debugging
+                print(f"→ {finger} {joint_name} → motor {idx}: "
+                      f"{np.rad2deg(cmd[idx]):.1f}° (clipped from {sd:.1f}°)")
 
         # --------------------- Thumb -----------------------------
         if self.teleop_vars.get("Thumb", tk.BooleanVar(value=False)).get() and "Thumb" in angles:
@@ -755,9 +1011,68 @@ class LeapHandGUI:
                      min(cal["servo_open"], cal["servo_closed"]))
             cmd[tidx[3]] = np.deg2rad(sd)
 
-        # ---------- send & remember pose -------------------------
-        if self.hand_active_var.get():
-            self.leap_node.set_leap(lhu.angle_safety_clip(cmd))
+        # 3) Reset each controlled joint in PyBullet (positional arguments)
+        # cmd_deg is your human‐servo degrees array; if you only have cmd in radians,
+        # convert back: sd_rad = cmd[cmd_idx]; sd_deg = np.rad2deg(sd_rad)
+        # but better: compute sd_deg before mapping into cmd[]
+
+        for cmd_idx, pb_idx in self.cmd_to_pb_index.items():
+            if cmd_idx not in self.joint_map:
+                continue
+            # Convert the smoothed human‐servo deg → radians
+            sd_rad = np.deg2rad(cmd_deg[cmd_idx])
+
+            # Apply the new linear map
+            A, B = self.joint_map[cmd_idx]
+            sim_angle = A * sd_rad + B
+
+            p.setJointMotorControl2(
+                self.hand_id,
+                pb_idx,
+                p.POSITION_CONTROL,
+                targetPosition=sim_angle,
+                positionGain=0.8,
+                velocityGain=1.0,
+                force=100
+            )
+        p.stepSimulation()
+
+
+        # 5) Query for self-collision contacts (positional)
+        # getContactPoints(bodyUniqueIdA, bodyUniqueIdB=-1, linkIndexA=-1, linkIndexB=-1)
+        contacts = p.getContactPoints(self.hand_id)
+        real_collisions = []
+        for c in contacts:
+            linkA = c[3]  # linkIndexA
+            linkB = c[4]  # linkIndexB
+
+            # Skip any contact involving the base (link index -1)
+            if linkA < 0 or linkB < 0:
+                continue
+
+            # Skip adjacent link contacts (allowed self‐contacts)
+            if (linkA, linkB) in self._allowed_self_collisions:
+                continue
+
+            # Otherwise, record as a genuine collision
+            real_collisions.append((linkA, linkB))
+
+        # 3) If any remaining contacts exist, block the pose
+        if real_collisions:
+            print(f"[GUI][Collision] Real self-collision between links: {real_collisions}")
+            try:
+                self.mediapipe_label.config(highlightbackground="red", highlightthickness=2)
+                self.master.after(200, lambda: self.mediapipe_label.config(highlightthickness=0))
+            except Exception:
+                pass
+            return
+
+        # 6) No collision → forward to real robot if active, else store locally
+        if self.hand_active_var.get() and self.robot_initialized and self.leap_node:
+            safe_cmd = lhu.angle_safety_clip(cmd)
+            self.leap_node.set_leap(safe_cmd)
+            self.current_command = safe_cmd
+        else:
             self.current_command = cmd
 
     def update_mediapipe_image(self, photo):
@@ -822,13 +1137,34 @@ class LeapHandGUI:
 
     def position_slider_changed(self, idx, value):
         try:
-            angle_deg = float(value)
-            self.current_command[idx] = np.deg2rad(angle_deg)
-            # Only send the new pose if the hand is activated:
-            if self.hand_active_var.get():
-                self.leap_node.set_leap(self.current_command)
+            # 1) Read the slider command
+            cmd_deg = float(value)
+            cmd_rad = np.deg2rad(cmd_deg)
+
+            # 2) Figure out this joint’s PB limits
+            pb_idx = self.cmd_to_pb_index[idx]
+            lo, hi = self.pb_joint_limits[pb_idx]
+
+            # 3) Clamp the command to [lo, hi]
+            clamped_rad = max(min(cmd_rad, hi), lo)
+            clamped_deg = np.degrees(clamped_rad)
+            self.current_command[idx] = clamped_rad
+
+            # 4) Kinematically reset so no force‐limit jumps
+            p.resetJointState(self.hand_id, pb_idx, clamped_rad, 0)
+            p.stepSimulation()
+
+            # 5) Read back actual (should equal clamped_rad)
+            actual_rad = p.getJointState(self.hand_id, pb_idx)[0]
+            actual_deg = np.degrees(actual_rad)
+
+            # 6) Print for comparison
+            print(f"[SliderCmd ] cmd_idx={idx} → commanded={cmd_deg:.1f}°  "
+                  f"clamped={clamped_deg:.1f}°")
+            print(f"[SimState ] cmd_idx={idx} → actual   ={actual_deg:.1f}°")
+
         except Exception as e:
-            print(f"Error in position_slider_changed for joint {idx}: {e}")
+            print(f"[Error] Slider {idx}: {e}")
 
     def effort_limit_changed(self, value):
         try:
@@ -1021,6 +1357,28 @@ class LeapHandGUI:
             print("Error disconnecting sensors:", e)
 
         self.master.destroy()
+
+    def record_calibration(self, phase: str):
+        """
+        phase = "open" or "closed".
+        Grabs the most recent Mediapipe angles and prints/stores them.
+        """
+        if not hasattr(self, "last_human_angles") or self.last_human_angles is None:
+            print("[Calib] No hand detected yet.")
+            return
+
+        ang = self.last_human_angles
+        print(f"\n=== Calibration ({phase}) ===")
+        for finger, joints in ang.items():
+            # Build a line only for available keys
+            parts = []
+            for joint_key in ["abduction", "mcp", "pip", "dip", "twist"]:
+                if joint_key in joints and joints[joint_key] is not None:
+                    parts.append(f"{joint_key}={joints[joint_key]:.1f}°")
+                    # Store it
+                    self.human_cal[finger].setdefault(phase, {})[joint_key] = joints[joint_key]
+            print(f"{finger}:  " + ", ".join(parts))
+        print("=== End Calibration ===\n")
 
 
 def main():

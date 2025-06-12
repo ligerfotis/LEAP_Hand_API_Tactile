@@ -9,7 +9,7 @@ class LeapNode:
         self.kP = 1000
         self.kI = 0
         self.kD = 200
-        self.curr_lim = 550
+        self.curr_lim = 300
         self.prev_pos = self.pos = self.curr_pos = None  # to be initialized
         self.motors = list(range(16))
         self.write_lock = threading.Lock()
